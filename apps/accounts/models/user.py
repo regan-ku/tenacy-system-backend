@@ -43,7 +43,7 @@ class User(AbstractUser):
         CARETAKER = 'caretaker', 'Property Caretaker'
         TENANT = 'tenant', 'Tenant'
 
-    # Override username to make email the primary identifier
+    # Override username to make email the primary identifier for better maintainance
     username = None 
     
     email = models.EmailField(
