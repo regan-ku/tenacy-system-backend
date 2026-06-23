@@ -34,7 +34,8 @@ class PropertyValidationService:
         """
         Ensures generating new units will not exceed the property's total capacity.
         """
-        current_units_count = property.units.count()
+        # ✅ FIX: Use explicit query to avoid related_name issues
+        current_units_count = Unit.objects.filter(property_ref=property).count()
         if current_units_count + requested_quantity > property.total_units_capacity:
             raise ValidationError(
                 f"Cannot generate {requested_quantity} units. Property capacity is {property.total_units_capacity}, "
@@ -46,13 +47,22 @@ class PropertyValidationService:
         """
         Ensures the billing cycle makes sense for the property type.
         """
+        # ✅ CRITICAL FIX: Safely get enum values to prevent AttributeError 
+        # if some choices (like VACATION_HOME) are missing in models.py
         hospitality_types = [
-            PropertySubType.AIRBNB, PropertySubType.HOTEL, PropertySubType.GUEST_HOUSE,
-            PropertySubType.VACATION_HOME, PropertySubType.HOLIDAY_COTTAGE, PropertySubType.SERVICED_APARTMENT
+            getattr(PropertySubType, attr, None) 
+            for attr in ['AIRBNB', 'HOTEL', 'GUEST_HOUSE', 'VACATION_HOME', 'HOLIDAY_COTTAGE', 'SERVICED_APARTMENT']
         ]
+        hospitality_types = [val for val in hospitality_types if val is not None]
+
+        short_billing_cycles = [
+            getattr(BillingCycle, attr, None)
+            for attr in ['DAILY', 'WEEKLY']
+        ]
+        short_billing_cycles = [val for val in short_billing_cycles if val is not None]
         
         # If it's hospitality, daily/weekly is allowed. Otherwise, enforce monthly+.
-        if property_sub_type not in hospitality_types and billing_cycle in [BillingCycle.DAILY, BillingCycle.WEEKLY]:
+        if property_sub_type not in hospitality_types and billing_cycle in short_billing_cycles:
             raise ValidationError(
                 f"Billing cycle '{billing_cycle}' is not valid for {property_sub_type}. "
                 "Use Monthly, Quarterly, or Yearly for standard rentals."
@@ -62,23 +72,17 @@ class PropertyValidationService:
     def should_skip_unit_group(property: Property) -> bool:
         """
         Determines if the property onboarding should skip the Unit Group creation step.
-        
-        ARCHITECTURAL RULE:
-        1. Residential structures (Bungalows, Villas, Townhouses, Apartments, etc.) can be 
-           EITHER single-unit OR multi-unit. We DO NOT guess based on sub-type. 
-           We ONLY respect the explicit 'is_single_unit_property' flag ticked on the frontend.
-        2. Land/Plots inherently do not have rentable 'units', so we auto-skip them.
         """
         # 1. Explicit flag from the frontend takes absolute precedence
         if property.is_single_unit_property:
             return True
             
-        # 2. Auto-skip ONLY for land/plots which inherently don't have unit groups
+        # ✅ FIX: Safely get enum values for land/plots to prevent AttributeErrors
         land_and_plot_subtypes = [
-            PropertySubType.RESIDENTIAL_PLOT, 
-            PropertySubType.COMMERCIAL_LAND, 
-            PropertySubType.AGRICULTURAL_LAND
+            getattr(PropertySubType, attr, None)
+            for attr in ['RESIDENTIAL_PLOT', 'COMMERCIAL_LAND', 'AGRICULTURAL_LAND', 'LAND']
         ]
+        land_and_plot_subtypes = [val for val in land_and_plot_subtypes if val is not None]
         
         return property.property_sub_type in land_and_plot_subtypes
 
@@ -87,7 +91,7 @@ class PropertyValidationService:
         """Validates unit group data before creation."""
         PropertyValidationService.validate_billing_cycle(
             property.property_sub_type, 
-            unit_group_data.get('billing_cycle', BillingCycle.MONTHLY)
+            unit_group_data.get('billing_cycle', 'monthly') # ✅ Used string literal to be safe
         )
         PropertyValidationService.validate_unit_generation_capacity(
             property, 

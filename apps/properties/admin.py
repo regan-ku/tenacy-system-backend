@@ -7,25 +7,51 @@ class LocationAdmin(admin.ModelAdmin):
     search_fields = ('city', 'county', 'estate', 'street', 'landmark', 'normalized_address')
     list_filter = ('city', 'county')
 
+
+# ✅ NEW: Inlines to show Unit Groups and Units directly on the Property page
+class UnitGroupInline(admin.TabularInline):
+    model = UnitGroup
+    extra = 0
+    fields = ('name', 'unit_type', 'floor_range', 'billing_cycle', 'base_rent_amount', 'capacity', 'is_active')
+    show_change_link = True
+    # Make fields read-only so they can only be edited from the dedicated Unit Group page
+    readonly_fields = ('name', 'unit_type', 'floor_range', 'billing_cycle', 'base_rent_amount', 'capacity') 
+
+class UnitInline(admin.TabularInline):
+    model = Unit
+    extra = 0
+    fields = ('unit_code', 'unit_group', 'unit_type', 'floor_number', 'rent_amount', 'status')
+    show_change_link = True
+    readonly_fields = ('unit_code', 'unit_group', 'unit_type', 'floor_number', 'rent_amount')
+
+
 @admin.register(Property)
 class PropertyAdmin(admin.ModelAdmin):
-    # ✅ ADDED: is_published and listing_type to the list view
     list_display = ('title', 'property_sub_type', 'location_city', 'total_units_capacity', 'is_active', 'is_published', 'listing_type', 'created_at')
-    
-    # ✅ ADDED: Filters for marketplace visibility
     list_filter = ('property_category', 'property_sub_type', 'is_active', 'is_published', 'listing_type', 'ownership_status')
     search_fields = ('title', 'description', 'location__city', 'location__county')
-    readonly_fields = ('created_at', 'updated_at')
+    
+    # ✅ ADDED: display_location_details to readonly fields
+    readonly_fields = ('created_at', 'updated_at', 'display_location_details')
     raw_id_fields = ('created_by', 'current_manager')
+    
+    # ✅ ADDED: Inlines for Units and Unit Groups
+    inlines = [UnitGroupInline, UnitInline]
     
     fieldsets = (
         ('Basic Info', {'fields': ('title', 'description', 'cover_photo')}),
         ('Ownership & Management', {'fields': ('created_by', 'current_manager', 'ownership_status')}),
         ('Classification', {'fields': ('property_category', 'property_sub_type', 'construction_type')}),
+        
+        # ✅ NEW: Dedicated Location Section with Read-Only Address Details
+        ('Location Details', {
+            'fields': ('location', 'display_location_details'),
+            'description': 'The location object is linked here. Full address and GPS details are auto-generated via geo-coding.'
+        }),
+        
         ('Structure', {'fields': ('number_of_floors', 'total_units_capacity', 'is_single_unit_property')}),
         ('Amenities', {'fields': ('has_water', 'has_electricity', 'has_internet', 'has_cctv', 'has_elevator', 'has_generator', 'has_gym', 'has_swimming_pool', 'allows_pets', 'parking_spaces')}),
         
-        # ✅ NEW: Dedicated Marketplace Visibility Section
         ('Marketplace Visibility', {
             'fields': ('is_published', 'listing_type'),
             'description': 'Control whether this property is visible on the public marketplace.'
@@ -35,8 +61,23 @@ class PropertyAdmin(admin.ModelAdmin):
     )
 
     def location_city(self, obj):
-        return f"{obj.location.estate or ''}, {obj.location.city}"
+        if obj.location:
+            return f"{obj.location.estate or ''}, {obj.location.city}"
+        return "No Location"
     location_city.short_description = 'Location'
+
+    # ✅ NEW: Method to display full location details directly on the Property page
+    def display_location_details(self, obj):
+        if obj.location:
+            loc = obj.location
+            address_parts = [loc.estate, loc.street, loc.city, loc.county, loc.region]
+            full_address = ", ".join([p for p in address_parts if p])
+            landmark = f" | Landmark: {loc.landmark}" if loc.landmark else ""
+            gps = f" | GPS: {loc.latitude}, {loc.longitude}" if loc.latitude and loc.longitude else ""
+            return f"{full_address}{landmark}{gps}"
+        return "No location assigned."
+    display_location_details.short_description = 'Full Address & Coordinates'
+
 
 @admin.register(UnitGroup)
 class UnitGroupAdmin(admin.ModelAdmin):
@@ -49,6 +90,7 @@ class UnitGroupAdmin(admin.ModelAdmin):
         return obj.property.title
     property_title.short_description = 'Property'
 
+
 @admin.register(Unit)
 class UnitAdmin(admin.ModelAdmin):
     list_display = ('unit_code', 'property_title', 'unit_type', 'floor_number', 'rent_amount', 'status', 'created_at')
@@ -60,6 +102,7 @@ class UnitAdmin(admin.ModelAdmin):
     def property_title(self, obj):
         return obj.property_ref.title
     property_title.short_description = 'Property'
+
 
 @admin.register(PropertyMedia)
 class PropertyMediaAdmin(admin.ModelAdmin):

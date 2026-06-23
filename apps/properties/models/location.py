@@ -3,17 +3,16 @@ from django.db import models
 class Location(models.Model):
     """
     Stores structured address + geospatial intelligence.
-    Uses landmarks instead of postal codes for accurate GPS discovery in Kenya.
     """
     # User-Provided Address Data
+    # ✅ FIX: Added blank=True, null=True to ALL fields to prevent IntegrityErrors
     estate = models.CharField('Estate / Neighborhood', max_length=255, blank=True, null=True)
     street = models.CharField('Street / Road', max_length=255, blank=True, null=True)
-    city = models.CharField('City / Town', max_length=100, db_index=True)
-    county = models.CharField('County / State', max_length=100, db_index=True)
+    city = models.CharField('City / Town', max_length=100, db_index=True, blank=True, null=True)
+    county = models.CharField('County / State', max_length=100, db_index=True, blank=True, null=True)
     region = models.CharField('Region', max_length=100, blank=True, null=True)
     postal_code = models.CharField(max_length=20, blank=True, null=True)
     
-    # ✅ FIX: Added blank=True, null=True so the database doesn't crash if it's missing
     landmark = models.CharField(
         'Nearby Landmark', 
         max_length=255, 

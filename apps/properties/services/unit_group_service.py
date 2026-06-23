@@ -3,6 +3,7 @@ import math
 from django.db import transaction
 from django.core.exceptions import ValidationError
 from ..models import UnitGroup, Unit
+from ..models.enums import UnitStatus
 from ..utils.generators import generate_unit_code, validate_unit_generation_capacity
 from .validation_service import PropertyValidationService
 
@@ -16,10 +17,6 @@ class UnitGroupService:
     def create_unit_group(property, name: str, unit_type: str, floor_range: str, 
                           billing_cycle: str, billing_date: int, base_rent_amount: float, 
                           deposit_amount: float, service_charge: float, capacity: int, **kwargs) -> UnitGroup:
-        """
-        Creates a unit group template. Does not generate units yet.
-        """
-        # Validate capacity against property limits
         validate_unit_generation_capacity(property, capacity)
         
         return UnitGroup.objects.create(
@@ -38,17 +35,53 @@ class UnitGroupService:
 
     @staticmethod
     @transaction.atomic
-    def generate_units_from_group(unit_group: UnitGroup, user) -> list:
+    def update_unit_group(instance: UnitGroup, update_data: dict) -> UnitGroup:
+        for key, value in update_data.items():
+            setattr(instance, key, value)
+        instance.save()
+        return instance
+
+    # ✅ NEW: DELETION LOGIC WITH STRICT BUSINESS RULES
+    @staticmethod
+    @transaction.atomic
+    def delete_unit_group(unit_group: UnitGroup) -> None:
         """
-        Bulk generates individual Unit records based on the Unit Group template.
-        ✅ UPDATED: Now intelligently distributes units across the defined floor range.
+        Deletes a unit group and all its associated available/reserved units.
+        CRITICAL RULE: Cannot delete if ANY unit in the group is occupied.
         """
-        property_obj = unit_group.property
+        # 1. Check for occupied units in this group
+        occupied_units_exist = Unit.objects.filter(
+            unit_group=unit_group, 
+            status=UnitStatus.OCCUPIED
+        ).exists()
         
-        # 1. Validate generation won't exceed capacity
+        if occupied_units_exist:
+            raise ValidationError(
+                "Cannot delete this Unit Group because it contains occupied units. "
+                "Terminate all tenancies in this group first."
+            )
+        
+        # 2. Double-check active tenancy records linked to this group's units
+        from apps.tenancy.models.tenancy import Tenancy
+        active_tenancies_exist = Tenancy.objects.filter(
+            unit__unit_group=unit_group, 
+            status='active'
+        ).exists()
+        
+        if active_tenancies_exist:
+            raise ValidationError(
+                "Cannot delete this Unit Group because it has active tenancy records."
+            )
+
+        # 3. Safe to delete (Django will cascade delete the non-occupied units)
+        unit_group.delete()
+
+    @staticmethod
+    @transaction.atomic
+    def generate_units_from_group(unit_group: UnitGroup, user) -> list:
+        property_obj = unit_group.property
         PropertyValidationService.validate_unit_generation_capacity(property_obj, unit_group.capacity)
         
-        # 2. Parse floor range (e.g., "1-3" -> start=1, end=3. Or "Ground" -> start=0, end=0)
         try:
             parts = unit_group.floor_range.split('-')
             start_floor = int(parts[0])
@@ -61,17 +94,12 @@ class UnitGroupService:
         if total_floors <= 0:
             total_floors = 1
 
-        # 3. Calculate distribution
         units_per_floor = math.ceil(unit_group.capacity / total_floors)
-        
         created_units = []
-        global_sequence = 1 # Ensures unique unit codes across all floors
+        global_sequence = 1 
         
-        # 4. Loop through each floor and create the allocated units
         for current_floor in range(start_floor, end_floor + 1):
-            # Calculate how many units to create on THIS specific floor
             if current_floor == end_floor:
-                # On the last floor, create whatever is remaining to hit the exact capacity
                 units_to_create_here = unit_group.capacity - (global_sequence - 1)
             else:
                 units_to_create_here = units_per_floor
@@ -80,7 +108,6 @@ class UnitGroupService:
                 break
 
             for _ in range(units_to_create_here):
-                # Generate unique code using utils
                 unit_code = generate_unit_code(
                     property_id=property_obj.id,
                     group_prefix=unit_group.name,
@@ -88,13 +115,12 @@ class UnitGroupService:
                     sequence=global_sequence
                 )
                 
-                # Create Unit, inheriting financial and billing rules from the group
                 unit = Unit.objects.create(
                     property_ref=property_obj, 
                     unit_group=unit_group,
                     unit_code=unit_code,
                     unit_type=unit_group.unit_type,
-                    floor_number=current_floor, # ✅ Now correctly assigned per floor
+                    floor_number=current_floor, 
                     rent_amount=unit_group.base_rent_amount,
                     deposit_amount=unit_group.deposit_amount,
                     service_charge=unit_group.service_charge,
@@ -107,24 +133,13 @@ class UnitGroupService:
             
         return created_units
 
-    # ✅🚨 NEW ARCHITECTURAL BRIDGE METHOD
     @staticmethod
     @transaction.atomic
     def finalize_property_unit_groups(property, user, groups_data: list) -> list:
-        """
-        ARCHITECTURAL BRIDGE: 
-        Takes frontend Unit Group drafts, saves them to the DB, and immediately 
-        generates the individual Unit records. This ensures Units exist in the DB 
-        before the user proceeds to the Media Upload step.
-        """
         created_groups = []
-        
-        # 1. Clear any existing draft groups for this property to prevent duplicates on resubmission
         UnitGroup.objects.filter(property=property).delete()
         
-        # 2. Create each group and generate its units
         for group_data in groups_data:
-            # Create the Unit Group record
             group = UnitGroup.objects.create(
                 property=property,
                 name=group_data.get('name'),
@@ -139,10 +154,7 @@ class UnitGroupService:
                 capacity=group_data.get('capacity'),
                 allows_pets_override=group_data.get('allows_pets_override')
             )
-            
-            # ✅ CRITICAL: Immediately generate the individual units for this group
             UnitGroupService.generate_units_from_group(group, user)
-            
             created_groups.append(group)
             
         return created_groups

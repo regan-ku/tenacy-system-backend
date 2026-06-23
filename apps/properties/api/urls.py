@@ -19,9 +19,9 @@ urlpatterns = [
         'get': 'retrieve', 'put': 'update', 'patch': 'partial_update', 'delete': 'destroy'
     }), name='property-unit-group-detail'),
 
-    # Nested Unit routes: /api/properties/<id>/units/
+    # ✅ FIX: Nested Unit routes: Added 'post': 'create' to allow adding units
     path('properties/<int:property_pk>/units/', views.UnitViewSet.as_view({
-        'get': 'list'
+        'get': 'list', 'post': 'create' 
     }), name='property-unit-list'),
     
     path('properties/<int:property_pk>/units/<int:pk>/', views.UnitViewSet.as_view({

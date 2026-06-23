@@ -1,7 +1,7 @@
 from django.db import transaction
 from django.core.exceptions import ValidationError
 from ..models import Property, Unit, UnitGroup
-from ..models.enums import UnitStatus, BillingCycle
+from ..models.enums import UnitStatus
 from .validation_service import PropertyValidationService
 from ..utils.generators import generate_unit_code
 
@@ -24,24 +24,15 @@ class UnitService:
         billing_date: int,
         unit_code: str = None
     ) -> Unit:
-        """
-        Creates a single unit directly linked to the property. 
-        Used for Mansions, Bungalows, Plots, etc.
-        """
-        # 1. Validate it's actually a single-unit property
         if not PropertyValidationService.should_skip_unit_group(property_obj):
-            raise ValidationError(
-                "This property type requires Unit Groups for bulk management. "
-                "Please use the Unit Group generation workflow instead."
-            )
+            raise ValidationError("This property type requires Unit Groups for bulk management.")
 
-        # 2. CRITICAL: Validate floor number against property floors
+        # ✅ CRITICAL FIX: Validate capacity before creating (should be 1 for single units)
+        PropertyValidationService.validate_unit_generation_capacity(property_obj, 1)
+
         PropertyValidationService.validate_floor_assignment(property_obj, floor_number)
-
-        # 3. Validate billing cycle for this property type
         PropertyValidationService.validate_billing_cycle(property_obj.property_sub_type, billing_cycle)
 
-        # 4. Generate unit code if not provided
         if not unit_code:
             unit_code = generate_unit_code(
                 property_id=property_obj.id,
@@ -50,21 +41,18 @@ class UnitService:
                 sequence=1
             )
             
-        # ✅ FIX: Changed 'property=' to 'property_ref='
         if Unit.objects.filter(property_ref=property_obj, unit_code=unit_code).exists():
             raise ValidationError(f"Unit code '{unit_code}' already exists for this property.")
 
-        # 5. Create the unit
         unit = Unit.objects.create(
-            property_ref=property_obj, # ✅ FIX: Changed from property=
-            unit_group=None, # Explicitly null for single-unit properties
+            property_ref=property_obj,
+            unit_group=None,
             unit_code=unit_code,
             unit_type=unit_type,
             floor_number=floor_number,
             rent_amount=rent_amount,
             deposit_amount=deposit_amount,
             service_charge=service_charge,
-            # ✅ FIX: Removed currency="KES" because it's not a DB column on the Unit model
             billing_cycle=billing_cycle,
             billing_date=billing_date,
             status=UnitStatus.AVAILABLE
@@ -73,16 +61,54 @@ class UnitService:
 
     @staticmethod
     @transaction.atomic
+    def create_unit_in_group(property_obj: Property, unit_group: UnitGroup, floor_number: int) -> Unit:
+        """
+        Creates a single unit within an existing Unit Group, inheriting all pricing and billing rules.
+        """
+        # ✅ CRITICAL FIX: Validate that adding 1 unit won't exceed the property's total capacity
+        PropertyValidationService.validate_unit_generation_capacity(property_obj, 1)
+
+        # 1. Validate floor number against property floors
+        PropertyValidationService.validate_floor_assignment(property_obj, floor_number)
+
+        # 2. Generate unique unit code
+        existing_count = Unit.objects.filter(property_ref=property_obj).count()
+        sequence = existing_count + 1
+        
+        unit_code = generate_unit_code(
+            property_id=property_obj.id,
+            group_prefix=unit_group.name,
+            floor_number=floor_number,
+            sequence=sequence
+        )
+        
+        # Fallback if code somehow already exists
+        if Unit.objects.filter(property_ref=property_obj, unit_code=unit_code).exists():
+            unit_code = f"{unit_code}-{sequence}"
+
+        # 3. Create the unit inheriting from the group
+        unit = Unit.objects.create(
+            property_ref=property_obj,
+            unit_group=unit_group,
+            unit_code=unit_code,
+            unit_type=unit_group.unit_type,
+            floor_number=floor_number,
+            rent_amount=unit_group.base_rent_amount,
+            deposit_amount=unit_group.deposit_amount,
+            service_charge=unit_group.service_charge,
+            billing_cycle=unit_group.billing_cycle,
+            billing_date=unit_group.billing_date,
+            status=UnitStatus.AVAILABLE
+        )
+        return unit
+
+    @staticmethod
+    @transaction.atomic
     def update_unit(unit: Unit, update_data: dict) -> Unit:
-        """
-        Updates an individual unit, enforcing strict validation rules on the new data.
-        """
         if 'floor_number' in update_data:
-            # ✅ FIX: Changed unit.property to unit.property_ref
             PropertyValidationService.validate_floor_assignment(unit.property_ref, update_data['floor_number'])
             
         if 'billing_cycle' in update_data:
-            # ✅ FIX: Changed unit.property to unit.property_ref
             PropertyValidationService.validate_billing_cycle(unit.property_ref.property_sub_type, update_data['billing_cycle'])
             
         for key, value in update_data.items():
@@ -94,9 +120,6 @@ class UnitService:
     @staticmethod
     @transaction.atomic
     def update_unit_status(unit: Unit, new_status: str) -> Unit:
-        """
-        Safely updates unit status (e.g., available -> occupied).
-        """
         valid_statuses = [choice[0] for choice in UnitStatus.choices]
         if new_status not in valid_statuses:
             raise ValidationError(f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
@@ -109,10 +132,25 @@ class UnitService:
         return unit
 
     @staticmethod
+    @transaction.atomic
+    def delete_unit(unit: Unit) -> None:
+        if unit.status == UnitStatus.OCCUPIED:
+            raise ValidationError(
+                "Cannot delete this unit because it is currently occupied. "
+                "You must terminate the active tenancy first."
+            )
+        
+        from apps.tenancy.models.tenancy import Tenancy
+        active_tenancy_exists = Tenancy.objects.filter(unit=unit, status='active').exists()
+        if active_tenancy_exists:
+            raise ValidationError(
+                "Cannot delete this unit because it has an active tenancy record in the system."
+            )
+
+        unit.delete()
+
+    @staticmethod
     def get_unit_with_inheritance(unit: Unit) -> dict:
-        """
-        Returns unit data merged with inherited property rules for clean API serialization.
-        """
         return {
             "unit_id": unit.id,
             "unit_code": unit.unit_code,
@@ -124,7 +162,6 @@ class UnitService:
             "billing_cycle": unit.billing_cycle,
             "billing_date": unit.billing_date,
             "status": unit.status,
-            # ✅ FIX: Changed unit.property to unit.property_ref for inherited fields
             "allows_pets": unit.property_ref.allows_pets,
             "parking_spaces": unit.property_ref.parking_spaces,
             "property_has_internet": unit.property_ref.has_internet,
