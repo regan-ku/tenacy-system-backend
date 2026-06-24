@@ -85,7 +85,6 @@ class AgencyDetailSerializer(serializers.ModelSerializer):
     def get_staff_count(self, obj):
         return obj.staff_members.filter(status='active').count()
 
-
 class AgencyDirectorSerializer(serializers.ModelSerializer):
     class Meta:
         model = AgencyDirector
@@ -94,6 +93,8 @@ class AgencyDirectorSerializer(serializers.ModelSerializer):
             'email', 'phone_number', 'nationality', 'address', 
             'ownership_percentage', 'is_primary_director', 'verification_status'
         ]
+        # ✅ Prevent frontend from accidentally sending user or status
+        read_only_fields = ['user', 'verification_status']
 
     def validate(self, data):
         if not data.get('national_id') and not data.get('passport_number'):
@@ -101,9 +102,16 @@ class AgencyDirectorSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        agency = self.context['agency']
+        # ✅ FIX: Extract 'agency' from validated_data (passed via serializer.save(agency=agency) in the View)
+        agency = validated_data.pop('agency')
         user = self.context['request'].user
-        return DirectorService.add_director(agency=agency, created_by_user=user, **validated_data)
+        
+        # Call your service layer
+        return DirectorService.add_director(
+            agency=agency, 
+            created_by_user=user, 
+            **validated_data
+        )
 
 
 class AgencyVerificationSerializer(serializers.ModelSerializer):

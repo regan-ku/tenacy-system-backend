@@ -93,15 +93,30 @@ class UnitGroupAdmin(admin.ModelAdmin):
 
 @admin.register(Unit)
 class UnitAdmin(admin.ModelAdmin):
-    list_display = ('unit_code', 'property_title', 'unit_type', 'floor_number', 'rent_amount', 'status', 'created_at')
-    list_filter = ('status', 'unit_type', 'billing_cycle')
+    # ✅ ADDED: unit_group_name to display
+    list_display = ('unit_code', 'property_title', 'unit_group_name', 'unit_type', 'floor_number', 'rent_amount', 'status')
+    
+    # ✅ ADDED: property_ref and unit_group to filters. 
+    # Now you can select "Kilimai Apartment" from the right sidebar and see EXACTLY how many units it has.
+    list_filter = ('property_ref', 'unit_group', 'status', 'unit_type', 'billing_cycle')
+    
     search_fields = ('unit_code', 'property_ref__title')
     readonly_fields = ('created_at', 'updated_at')
     raw_id_fields = ('property_ref', 'unit_group')
+    
+    # ✅ CRITICAL PERFORMANCE FIX: Prevents N+1 query issues when loading 50+ units
+    list_select_related = ('property_ref', 'unit_group')
 
     def property_title(self, obj):
         return obj.property_ref.title
     property_title.short_description = 'Property'
+    property_title.admin_order_field = 'property_ref__title'
+
+    # ✅ NEW: Display Unit Group clearly
+    def unit_group_name(self, obj):
+        return obj.unit_group.name if obj.unit_group else "—"
+    unit_group_name.short_description = 'Unit Group'
+    unit_group_name.admin_order_field = 'unit_group__name'
 
 
 @admin.register(PropertyMedia)

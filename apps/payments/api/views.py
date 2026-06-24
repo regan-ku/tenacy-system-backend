@@ -10,7 +10,8 @@ from .serializers import (
     ArrearsSerializer, TenantBalanceSerializer, WaiverRequestSerializer,
     RefundRequestSerializer, STKRequestSerializer
 )
-from ..models import PaymentAccount, Invoice, Payment, Arrears, TenantBalance, Receipt
+# ✅ ADDED: PaymentAccountVerification to imports
+from ..models import PaymentAccount, PaymentAccountVerification, Invoice, Payment, Arrears, TenantBalance, Receipt
 from ..permissions.payment_permissions import (
     IsFinancialStakeholder, CanTriggerPaymentRequest, CanApproveFinancialOverride,
     CanManagePaymentAccounts, CanReconcileTransactions
@@ -39,6 +40,18 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
         if user.is_staff:
             qs = PaymentAccount.objects.all()
         return qs.order_by("-is_default", "-is_verified", "-created_at")
+
+    # ✅ FIX: Assign owner AND auto-create a pending verification record
+    def perform_create(self, serializer):
+        account = serializer.save(owner=self.request.user)
+        
+        # Automatically generate a pending verification request
+        PaymentAccountVerification.objects.create(
+            payment_account=account,
+            requested_by=self.request.user,
+            method="manual_review",
+            status="pending"
+        )
 
     @extend_schema(responses={200: OpenApiResponse(description="Verification initiated successfully")})
     @action(detail=True, methods=["post"])

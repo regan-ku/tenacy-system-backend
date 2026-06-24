@@ -125,7 +125,11 @@ class ListingService:
             if filters.get('listing_type'):
                 queryset = queryset.filter(listing_type=filters['listing_type'])
 
-        return queryset.order_by('-created_at')
+        # ✅ BULLETPROOF DEDUPLICATION (POSTGRES SAFE):
+        # 1. order_by('property_id') satisfies Postgres's DISTINCT ON requirement.
+        # 2. order_by('min_rent_amount') ensures the cheapest listing (the Master Property Listing) is picked first.
+        # 3. distinct('property_id') ensures only ONE listing per property is returned to the frontend.
+        return queryset.order_by('property_id', 'min_rent_amount').distinct('property_id')
 
     @staticmethod
     @transaction.atomic

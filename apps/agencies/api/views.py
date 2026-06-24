@@ -5,6 +5,8 @@ from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResp
 
 from django.contrib.auth import get_user_model
 from django.apps import apps
+# ✅ CRITICAL FIX: Import Q objects for safe OR queries
+from django.db.models import Q 
 
 from . import serializers
 from ..models import Agency, AgencyDirector, AgencyVerification, AgencyProfile, AgencyStaff, DelegatedProperty
@@ -33,15 +35,15 @@ class AgencyViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             return Agency.objects.none()
             
-        if user.role == 'admin':
+        # ✅ FIX: Use getattr to prevent AttributeError if 'role' is missing
+        if getattr(user, 'role', None) == 'admin':
             return Agency.objects.all().select_related('business_profile')
         
+        # ✅ CRITICAL FIX: Use Q objects for OR queries to prevent 500 SQL join errors
         return Agency.objects.filter(
-            created_by=user
-        ) | Agency.objects.filter(
-            directors__user=user
-        ) | Agency.objects.filter(
-            staff_members__user=user, staff_members__status='active'
+            Q(created_by=user) | 
+            Q(directors__user=user) | 
+            Q(staff_members__user=user, staff_members__status='active')
         ).distinct().select_related('business_profile')
 
     def get_serializer_class(self):

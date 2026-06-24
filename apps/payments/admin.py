@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.utils import timezone
 from .models import (
     PaymentAccount, PaymentAccountVerification, Invoice, InvoiceItem,
     Payment, PaymentAllocation, Receipt, Arrears, Waiver, Refund,
@@ -22,8 +23,9 @@ class ReconciliationInline(admin.StackedInline):
 
 @admin.register(PaymentAccount)
 class PaymentAccountAdmin(admin.ModelAdmin):
-    list_display = ("account_name", "get_account_type_display", "owner", "is_verified", "is_active", "is_default", "created_at")
-    list_filter = ("account_type", "is_verified", "is_active", "created_at")
+    # ✅ ADDED: verification_status to list_display and list_filter
+    list_display = ("account_name", "get_account_type_display", "owner", "verification_status", "is_verified", "is_active", "is_default", "created_at")
+    list_filter = ("account_type", "verification_status", "is_verified", "is_active", "created_at")
     search_fields = ("account_name", "paybill_number", "till_number", "phone_number")
     readonly_fields = ("created_at", "updated_at")
     actions = ["activate_selected", "deactivate_selected"]
@@ -35,6 +37,42 @@ class PaymentAccountAdmin(admin.ModelAdmin):
     def deactivate_selected(self, request, queryset):
         queryset.update(is_active=False)
     deactivate_selected.short_description = "Deactivate selected accounts"
+
+
+# ✅ NEW: Register PaymentAccountVerification with Approval Actions
+@admin.register(PaymentAccountVerification)
+class PaymentAccountVerificationAdmin(admin.ModelAdmin):
+    list_display = ("payment_account", "method", "status", "requested_by", "created_at")
+    list_filter = ("status", "method")
+    search_fields = ("payment_account__account_name", "reference")
+    readonly_fields = ("created_at",)
+    
+    actions = ["approve_selected", "reject_selected"]
+
+    def approve_selected(self, request, queryset):
+        for ver in queryset:
+            ver.status = "verified"
+            ver.verified_at = timezone.now()
+            ver.save()
+            
+            # ✅ Sync the approval back to the parent Payment Account
+            ver.payment_account.is_verified = True
+            ver.payment_account.verification_status = "verified"
+            ver.payment_account.save(update_fields=["is_verified", "verification_status"])
+            
+    approve_selected.short_description = "✅ Approve selected verifications"
+
+    def reject_selected(self, request, queryset):
+        for ver in queryset:
+            ver.status = "rejected"
+            ver.save()
+            
+            # ✅ Sync the rejection back to the parent Payment Account
+            ver.payment_account.verification_status = "rejected"
+            ver.payment_account.save(update_fields=["verification_status"])
+            
+    reject_selected.short_description = "❌ Reject selected verifications"
+
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
@@ -76,5 +114,5 @@ class RefundAdmin(admin.ModelAdmin):
 @admin.register(TenantBalance)
 class TenantBalanceAdmin(admin.ModelAdmin):
     list_display = ("tenancy", "total_invoiced", "total_paid", "current_balance", "last_updated")
-    search_fields = ("tenancy__tenancy_code",)  # ✅ FIXED: Changed from string to tuple
+    search_fields = ("tenancy__tenancy_code",)
     readonly_fields = ("last_updated",)

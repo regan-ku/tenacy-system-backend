@@ -14,14 +14,14 @@ class DirectorService:
     def add_director(agency: Agency, created_by_user, full_name: str, national_id: str = None, 
                      passport_number: str = None, email: str = None, phone_number: str = None,
                      nationality: str = None, address: str = None, ownership_percentage: float = 0.00,
-                     is_primary: bool = False) -> AgencyDirector:
+                     is_primary_director: bool = False) -> AgencyDirector: # ✅ FIXED: Changed 'is_primary' to 'is_primary_director'
         """
         Adds a director to the agency. Validates that either National ID or Passport is provided.
         """
         if not national_id and not passport_number:
             raise ValidationError("A director must have either a National ID or a Passport Number.")
             
-        # Check for duplicate directors by ID/Passport across the system (optional but recommended for fraud prevention)
+        # Check for duplicate directors by ID/Passport across the system
         if national_id and AgencyDirector.objects.filter(national_id=national_id).exists():
             raise ValidationError("A director with this National ID already exists in the system.")
         if passport_number and AgencyDirector.objects.filter(passport_number=passport_number).exists():
@@ -37,7 +37,7 @@ class DirectorService:
             nationality=nationality,
             address=address,
             ownership_percentage=ownership_percentage,
-            is_primary_director=is_primary,
+            is_primary_director=is_primary_director, # ✅ FIXED: Updated variable name here
             verification_status=AgencyDirector.VerificationStatus.PENDING
         )
         
@@ -48,7 +48,7 @@ class DirectorService:
             details={
                 "director_id": director.id,
                 "full_name": full_name,
-                "is_primary": is_primary
+                "is_primary": is_primary_director # ✅ FIXED: Updated variable name here
             }
         )
         return director

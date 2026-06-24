@@ -14,9 +14,12 @@ class PaymentAccountSerializer(serializers.ModelSerializer):
         fields = [
             "id", "account_type", "account_type_display", "account_name", 
             "paybill_number", "till_number", "phone_number", 
-            "is_default", "is_active", "is_verified", "created_at"
+            "is_default", "is_active", "is_verified", 
+            "verification_status",  # ✅ ADDED: Now visible to frontend
+            "created_at"
         ]
-        read_only_fields = ["is_verified", "is_active", "created_at"]
+        # ✅ ADDED: Prevent frontend from manually changing verification status
+        read_only_fields = ["is_verified", "is_active", "verification_status", "created_at"] 
 
 
 class InvoiceItemSerializer(serializers.ModelSerializer):
