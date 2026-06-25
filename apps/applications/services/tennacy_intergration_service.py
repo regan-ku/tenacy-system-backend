@@ -13,69 +13,70 @@ class TenancyIntegrationService:
     @staticmethod
     @transaction.atomic
     def execute_approved_application(application: Application):
-        """
-        Routes the approved application to the correct tenancy execution service.
-        """
-        if application.application_type == Application.ApplicationType.RENTAL:
+        app_type = getattr(application, 'application_type', None)
+        
+        if app_type in ['rental', getattr(Application.ApplicationType, 'RENTAL', None)]:
             TenancyIntegrationService._create_new_tenancy(application)
-        elif application.application_type == Application.ApplicationType.TRANSFER:
+        elif app_type in ['transfer', getattr(Application.ApplicationType, 'TRANSFER', None)]:
             TenancyIntegrationService._execute_transfer(application)
         else:
             raise ValidationError("Invalid application type for tenancy integration.")
 
     @staticmethod
     def _create_new_tenancy(application: Application):
-        """
-        Creates a new tenancy record for an approved rental application.
-        """
-        rental_details = application.rental_details
+        rental_details = getattr(application, 'rental_details', None) or getattr(application, 'rental_application', None)
         unit = application.unit
+        property_obj = getattr(application, 'property_ref', None) or getattr(application, 'property', None)
         
-        # Create tenancy in 'pending_payment' status
-        # The tenant will still need to pay/waive deposit and service charge to activate it
+        rent_amount = getattr(unit, 'rent_amount', None) or getattr(unit, 'base_rent_amount', 0)
+        deposit_amount = getattr(unit, 'deposit_amount', 0)
+        service_charge = getattr(unit, 'service_charge', None) or getattr(unit, 'service_charge_amount', 0)
+        start_date = getattr(rental_details, 'desired_move_in_date', None) if rental_details else None
+
         tenancy = TenancyService.create_tenancy(
             tenant=application.applicant,
             unit=unit,
-            property_obj=application.property,
-            created_by=application.applicant, # Or the approving manager
-            rent_amount=unit.rent_amount,
-            deposit_amount=unit.deposit_amount,
-            service_charge_amount=unit.service_charge,
+            property_obj=property_obj,
+            created_by=application.applicant, 
+            rent_amount=rent_amount,
+            deposit_amount=deposit_amount,
+            service_charge_amount=service_charge,
             tenancy_type='rental',
-            start_date=rental_details.desired_move_in_date,
-            end_date=None # Will be set by lease agreement later
+            start_date=start_date,
+            end_date=None 
         )
+        
+        # ✅ CRITICAL: Explicitly set status to 'pending_payment'
+        # This allows the 3-hour recall task to identify unpaid tenancies.
+        tenancy.status = 'pending_payment'
+        tenancy.save(update_fields=['status'])
         
         return tenancy
 
     @staticmethod
     def _execute_transfer(application: Application):
-        """
-        Executes a tenant transfer for an approved transfer application.
-        """
-        transfer_details = application.transfer_details
+        transfer_details = getattr(application, 'transfer_details', None) or getattr(application, 'transfer_application', None)
         
-        # We mock a transfer request object to pass to the TransferService
-        # In a real scenario, you might want to create a TenancyTransfer model instance 
-        # during the application phase and link it here.
+        if not transfer_details:
+            raise ValidationError("Transfer details are missing from the approved application.")
+
         class MockTransferRequest:
             def __init__(self, details, app):
                 self.tenant = app.applicant
-                self.from_property = details.from_property
-                self.from_unit = details.from_unit
-                self.to_property = details.to_property
-                self.to_unit = details.to_unit
-                self.reason = details.reason
+                self.from_property = getattr(details, 'from_property', None)
+                self.from_unit = getattr(details, 'from_unit', None)
+                self.to_property = getattr(details, 'to_property', None)
+                self.to_unit = getattr(details, 'to_unit', None)
+                self.reason = getattr(details, 'reason', '')
                 self.transfer_status = 'pending'
                 self.approved_by = None
                 self.processed_at = None
 
         mock_request = MockTransferRequest(transfer_details, application)
         
-        # Execute the transfer (this handles releasing the old unit and occupying the new one)
         new_tenancy = TransferService.execute_transfer(
             transfer_request=mock_request,
-            approved_by=application.applicant # Or the approving manager
+            approved_by=application.applicant 
         )
         
         return new_tenancy

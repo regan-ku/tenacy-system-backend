@@ -2,9 +2,11 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema_field
 
-# ✅ REMOVED UNUSED MODEL IMPORTS
+from apps.properties.models.unit import Unit
+
 from ..models import Application, ApplicationNote
-from ..services import ApplicationService, ApprovalService
+# ✅ FIX: Import NotesService so we can safely save the applicant's notes
+from ..services import ApplicationService, ApprovalService, NotesService 
 
 User = get_user_model()
 
@@ -59,29 +61,54 @@ class ApplicationDetailSerializer(serializers.ModelSerializer):
 
 
 class RentalApplicationCreateSerializer(serializers.Serializer):
-    """
-    Serializer for creating a new rental application.
-    """
-    unit_id = serializers.IntegerField()
-    employment_status = serializers.ChoiceField(choices=[
-        ('employed', 'Employed'), ('self_employed', 'Self Employed'), 
-        ('student', 'Student'), ('unemployed', 'Unemployed')
-    ])
-    desired_move_in_date = serializers.DateField()
+    target_unit_id = serializers.IntegerField()
+    employment_status = serializers.CharField(max_length=100)
+    anticipated_move_in_date = serializers.DateField()
+    
+    notes = serializers.CharField(required=False, allow_blank=True)
+    full_name = serializers.CharField(required=False, allow_blank=True)
+    phone_number = serializers.CharField(required=False, allow_blank=True)
+    email = serializers.EmailField(required=False, allow_blank=True)
+
+    def validate_target_unit_id(self, value):
+        try:
+            unit = Unit.objects.get(id=value)
+        except Unit.DoesNotExist:
+            raise serializers.ValidationError("The selected unit does not exist.")
+        
+        if unit.status != 'available':
+            raise serializers.ValidationError("This unit is no longer available for applications.")
+            
+        return value
 
     def create(self, validated_data):
-        user = self.context['request'].user
-        # ✅ FIXED: Use apps.properties to prevent ModuleNotFoundError
-        from apps.properties.models import Unit
+        request = self.context['request']
+        user = request.user
         
-        unit = Unit.objects.get(id=validated_data['unit_id'])
+        unit = Unit.objects.get(id=validated_data['target_unit_id'])
         
-        return ApplicationService.create_rental_application(
+        # 1. Create the core application via the service
+        application = ApplicationService.create_rental_application(
             applicant=user,
             unit=unit,
             employment_status=validated_data['employment_status'],
-            desired_move_in_date=validated_data['desired_move_in_date']
+            desired_move_in_date=validated_data['anticipated_move_in_date']
         )
+        
+        # ✅ CRITICAL FIX: The Application model does NOT have a 'message' field.
+        # Instead of crashing, we save the frontend's 'notes' as an ApplicationNote.
+        # This perfectly aligns with your ApplicationDetailSerializer which expects a 'notes' array.
+        notes_content = validated_data.get('notes')
+        if notes_content:
+            NotesService.create_note(
+                application=application,
+                user=user,
+                content=notes_content,
+                note_type='applicant_note', # Categorized as a note from the applicant
+                is_confidential=False
+            )
+            
+        return application
 
 
 class TransferApplicationCreateSerializer(serializers.Serializer):
@@ -93,7 +120,6 @@ class TransferApplicationCreateSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         user = self.context['request'].user
-        # ✅ FIXED: Use apps. prefix for cross-app imports
         from apps.properties.models import Unit
         from apps.tenancy.models import Tenancy
         
@@ -123,7 +149,6 @@ class EvictionApplicationCreateSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         user = self.context['request'].user
-        # ✅ FIXED: Use apps.properties to prevent ModuleNotFoundError
         from apps.properties.models import Unit
         
         unit = Unit.objects.get(id=validated_data['unit_id'])

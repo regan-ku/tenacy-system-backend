@@ -1,7 +1,10 @@
 from django.core.exceptions import ValidationError
-from django.utils import timezone
 from ..models import Application
 from apps.properties.models import Unit
+
+# ✅ CRITICAL FIX: Use the full app path for cross-app imports. 
+# 'from tenancy.models' causes a fatal ModuleNotFoundError.
+from apps.tenancy.models import Tenancy
 
 class ApplicationValidationService:
     """
@@ -14,11 +17,10 @@ class ApplicationValidationService:
         """
         Validates that a user can submit a rental application for a specific unit.
         """
-        # 1. Check if unit is actually available
         if unit.status != 'available':
             raise ValidationError("This unit is no longer available for applications.")
 
-        # 2. Check for duplicate active applications from the same user for the same unit
+        # Check for duplicate active applications
         duplicate = Application.objects.filter(
             applicant=applicant,
             unit=unit,
@@ -29,8 +31,10 @@ class ApplicationValidationService:
         if duplicate:
             raise ValidationError("You already have a pending application for this unit.")
 
-        # 3. Check if the user is already an active tenant in this specific unit
-        from tenancy.models import Tenancy
+        # ✅ FIX: Safe property access (handles property_ref or property)
+        property_obj = getattr(unit, 'property_ref', None) or getattr(unit, 'property', None)
+        
+        # Check if the user is already an active tenant in this specific unit
         active_tenancy = Tenancy.objects.filter(
             tenant=applicant,
             unit=unit,
@@ -49,7 +53,6 @@ class ApplicationValidationService:
             raise ValidationError("Source and destination units cannot be the same.")
 
         # Check if user actually occupies the source unit
-        from tenancy.models import Tenancy
         active_tenancy = Tenancy.objects.filter(
             tenant=applicant,
             unit=from_unit,

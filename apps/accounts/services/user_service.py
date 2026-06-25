@@ -2,7 +2,7 @@ import json
 from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Count  # ✅ ADDED: For Smart Draft Detection
+from django.db.models import Count
 from ..models import User, Profile, NextOfKin, Verification
 
 class UserService:
@@ -56,44 +56,74 @@ class UserService:
                     "message": "Please complete your profile to continue."
                 }
 
-        # 2. TENANT LOGIC (Record-based)
+        # 2. TENANT LOGIC (Record-based & State-Driven)
         if is_acting_as_tenant:
+            # A. Check for active tenancy (Highest priority)
+            has_active_tenancy = Tenancy.objects.filter(tenant=user, status='active').exists()
+            if has_active_tenancy:
+                return {
+                    "profile_complete": True,
+                    "role": user.role,
+                    "next_route": "/dashboard/tenant",
+                    "message": "Welcome back to your tenant dashboard."
+                }
+
+            # B. Check for APPROVED applications (Ready to move in / finalize)
+            # If they have an approved application, they MUST go to the dashboard to see the badge.
+            has_approved_application = Application.objects.filter(
+                applicant=user,
+                status='approved'
+            ).exists()
+            
+            if has_approved_application:
+                return {
+                    "profile_complete": True,
+                    "role": user.role,
+                    "next_route": "/dashboard/tenant",
+                    "message": "You have an approved application. Proceed to your dashboard to finalize your tenancy."
+                }
+
+            # C. Check for pending/under_review applications
+            has_pending_application = Application.objects.filter(
+                applicant=user, 
+                status__in=['pending', 'under_review']
+            ).exists()
+            
+            if has_pending_application:
+                return {
+                    "profile_complete": True,
+                    "role": user.role,
+                    "next_route": "/applications/pending",
+                    "message": "Your application is currently under review by the property manager."
+                }
+
+            # D. Check for incomplete applications
             incomplete_app = Application.objects.filter(applicant=user, status='incomplete').first()
             if incomplete_app:
                 return {
                     "profile_complete": True,
                     "role": user.role,
-                    "next_route": f"/applications/wizard/{incomplete_app.id}",
+                    "next_route": "/marketplace", 
                     "message": "Resume your incomplete rental application."
                 }
-            
-            has_active_tenancy = Tenancy.objects.filter(tenant=user, status='active').exists()
-            if not has_active_tenancy:
-                return {
-                    "profile_complete": True,
-                    "role": user.role,
-                    "next_route": "/marketplace",
-                    "message": "You have no active tenancies. Browse available properties."
-                }
                 
+            # E. No active tenancy, no approved/pending applications -> Marketplace
             return {
                 "profile_complete": True,
                 "role": user.role,
-                "next_route": "/dashboard/tenant",
-                "message": "Welcome back to your tenant dashboard."
+                "next_route": "/marketplace",
+                "message": "You have no active tenancies. Browse available properties."
             }
 
-        # 3. LANDLORD & AGENCY LOGIC (✅ FIXED: Smart Draft Detection)
+        # 3. LANDLORD & AGENCY LOGIC (Smart Draft Detection)
         if user.role in [User.Role.LANDLORD, User.Role.AGENCY]:
             is_verified = False
             
-            # A. Check Landlord Verification (accounts.Verification model)
             if user.role == User.Role.LANDLORD:
                 verification = getattr(user, 'verification_record', None)
                 if verification and verification.status == 'verified':
                     is_verified = True
                     
-            # B. Check Agency Verification (agencies.Agency OR agencies.AgencyVerification models)
             elif user.role == User.Role.AGENCY:
                 try:
                     Agency = apps.get_model('agencies', 'Agency')
@@ -117,18 +147,16 @@ class UserService:
                     if verification and verification.status == 'verified':
                         is_verified = True
 
-            # If neither verification model shows 'verified', keep them in the waiting room
             if not is_verified:
                 return {
                     "profile_complete": True,
                     "role": user.role,
                     "next_route": "/pending-verification",
-                    "message": "Your identity and compliance documents are currently under review by our admin team. You will be redirected to your dashboard once your account is fully verified."
+                    "message": "Your identity and compliance documents are currently under review."
                 }
             
             Property = apps.get_model('properties', 'Property')
             
-            # AGENCY SPECIFIC: Check for pending delegated properties
             if user.role == User.Role.AGENCY:
                 try:
                     Agency = apps.get_model('agencies', 'Agency')
@@ -149,20 +177,16 @@ class UserService:
                                 "profile_complete": True,
                                 "role": user.role,
                                 "next_route": "/dashboard/agency",
-                                "message": "Welcome! You have pending property delegations from landlords waiting for your acceptance."
+                                "message": "Welcome! You have pending property delegations."
                             }
                 except Exception:
                     pass 
 
-            # ✅🚨 CRITICAL FIX: Smart Draft Detection
-            # A property is ONLY considered "complete" if it has Unit Groups or Media.
-            # If it has neither, it's just a Step 3 draft and the user abandoned the wizard.
             user_properties = Property.objects.filter(created_by=user).annotate(
                 groups_count=Count('unit_groups'),
                 media_count=Count('media')
             ).order_by('-created_at')
             
-            # Check if any property is "completed" (has groups or media)
             has_completed = any(p.groups_count > 0 or p.media_count > 0 for p in user_properties)
             
             if has_completed:
@@ -173,7 +197,6 @@ class UserService:
                     "message": "Welcome back to your management dashboard."
                 }
                 
-            # If no completed properties, but they have at least one draft
             if user_properties.exists():
                 draft_property = user_properties.first()
                 return {
@@ -183,7 +206,6 @@ class UserService:
                     "message": "Resume your incomplete property setup."
                 }
                 
-            # If no properties at all, send them to start the wizard
             return {
                 "profile_complete": True,
                 "role": user.role,
@@ -198,6 +220,8 @@ class UserService:
             "next_route": f"/dashboard/{user.role}",
             "message": "Welcome to your operational dashboard."
         }
+
+    # ... (Keep complete_onboarding, request_role_upgrade, update_profile, add_next_of_kin exactly as they were) ...
 
     @staticmethod
     @transaction.atomic

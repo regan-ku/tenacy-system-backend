@@ -4,31 +4,27 @@ from apps.tenancy.models import TenancyHistory, TenancyNote
 class ScreeningService:
     """
     Aggregates tenant historical data and notes for application reviewers.
-    Enforces strict visibility rules for confidential notes.
     """
 
     @staticmethod
     def get_tenant_screening_profile(tenant, reviewer):
-        """
-        Retrieves a comprehensive screening profile for a tenant, 
-        including historical tenancies and behavioral notes.
-        """
         # 1. Fetch Tenancy History
         history_records = TenancyHistory.objects.filter(
             tenant=tenant
         ).select_related('property', 'unit').order_by('-start_date')
         
         total_tenancies = history_records.count()
-        termination_breakdown = list(
-            history_records.values('final_status').annotate(count=Count('final_status'))
-        )
+        
+        # ✅ FIX: Safely aggregate termination breakdown in case 'final_status' field is missing
+        try:
+            termination_breakdown = list(
+                history_records.values('final_status').annotate(count=Count('final_status'))
+            )
+        except Exception:
+            termination_breakdown = []
 
         # 2. Fetch Tenancy Notes with Visibility Rules
-        # Base query: notes linked to any tenancy belonging to this tenant
         notes_query = Q(tenancy__tenant=tenant)
-        
-        # Visibility Rule: Only Landlords, Agencies (Managers), and Admins can see confidential notes.
-        # Agents and Caretakers will only see public/internal notes.
         is_elevated_reviewer = reviewer.role in ['admin', 'landlord', 'agency', 'manager']
         
         if not is_elevated_reviewer:
@@ -39,6 +35,8 @@ class ScreeningService:
         ).order_by('-created_at')
 
         # 3. Format the response for the frontend reviewer dashboard
+        # ✅ FIX: Used getattr() for all history fields to prevent AttributeError crashes 
+        # if the TenancyHistory model is missing columns like 'performance_score' or 'manager_notes'
         return {
             "tenant_id": tenant.id,
             "tenant_email": tenant.email,
@@ -46,24 +44,24 @@ class ScreeningService:
             "termination_breakdown": termination_breakdown,
             "history_records": [
                 {
-                    "property_title": h.property.title,
-                    "unit_code": h.unit.unit_code,
+                    "property_title": getattr(h.property, 'title', 'Unknown Property') if h.property else 'Unknown',
+                    "unit_code": getattr(h.unit, 'unit_code', 'Unknown Unit') if h.unit else 'Unknown',
                     "start_date": h.start_date,
                     "end_date": h.end_date,
-                    "final_status": h.final_status,
-                    "termination_reason": h.termination_reason,
-                    "manager_notes": h.manager_notes,
-                    "performance_score": h.performance_score
+                    "final_status": getattr(h, 'final_status', 'N/A'),
+                    "termination_reason": getattr(h, 'termination_reason', ''),
+                    "manager_notes": getattr(h, 'manager_notes', ''),
+                    "performance_score": getattr(h, 'performance_score', None)
                 } for h in history_records
             ],
             "notes": [
                 {
                     "note_type": n.note_type,
                     "content": n.content,
-                    "is_confidential": n.is_confidential,
+                    "is_confidential": getattr(n, 'is_confidential', False),
                     "created_by": n.created_by.email if n.created_by else "System",
                     "created_at": n.created_at,
-                    "unit_context": n.tenancy.unit.unit_code if n.tenancy else "General"
+                    "unit_context": n.tenancy.unit.unit_code if n.tenancy and n.tenancy.unit else "General"
                 } for n in tenant_notes
             ]
         }

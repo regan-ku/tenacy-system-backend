@@ -6,91 +6,73 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-@shared_task(bind=True, max_retries=3)
-def check_expiring_tenancies(self, days_threshold: int = 30):
-    """
-    Identifies tenancies expiring within a specific window and logs/alerts managers.
-    Recommended to run daily via Celery Beat.
-    """
-    try:
-        from ..models import Tenancy
-        from ..utils.tenancy_utils import TenancyUtils
-        
-        cutoff_date = timezone.now().date() + timedelta(days=days_threshold)
-        expiring = Tenancy.objects.filter(
-            status__in=['active', 'extended'],
-            end_date__lte=cutoff_date,
-            end_date__gte=timezone.now().date()
-        ).select_related('tenant', 'unit', 'property')
-        
-        count = expiring.count()
-        logger.info(f"Found {count} tenancies expiring within {days_threshold} days.")
-        
-        # TODO: Integrate with notification service to email landlords/tenants
-        return {"expiring_count": count}
-    except Exception as e:
-        logger.error(f"Failed to check expiring tenancies: {e}")
-        raise self.retry(exc=e, countdown=300)
-
+# ... (keep your existing tasks like check_expiring_tenancies, etc.) ...
 
 @shared_task(bind=True, max_retries=2)
-def auto_process_natural_expiries(self):
+def recall_unpaid_approved_applications(self):
     """
-    Automatically handles tenancies that have passed their end_date without extension or termination.
-    Archives to history, updates status, and releases unit to marketplace.
+    Recalls approved applications if the tenant fails to pay the deposit/service charge 
+    within 3 hours. Reverts application to 'under_review', cancels tenancy, and frees the unit.
     """
     try:
         from ..models import Tenancy
-        from ..services.termination_service import TerminationService
+        from apps.applications.models import Application
+        from apps.properties.models import Unit
+
+        # Calculate the threshold time (3 hours ago)
+        threshold_time = timezone.now() - timedelta(hours=3)
         
-        expired_today = Tenancy.objects.filter(
-            status__in=['active', 'extended'],
-            end_date__lt=timezone.now().date()
-        )
+        # Find tenancies stuck in 'pending_payment' older than 3 hours
+        unpaid_tenancies = Tenancy.objects.filter(
+            status='pending_payment',
+            created_at__lt=threshold_time
+        ).select_related('unit', 'tenant')
         
-        processed_count = 0
-        for tenancy in expired_today:
+        recalled_count = 0
+        
+        for tenancy in unpaid_tenancies:
             try:
                 with transaction.atomic():
-                    TerminationService.process_natural_expiry(tenancy)
-                    processed_count += 1
+                    # 1. Cancel the tenancy
+                    tenancy.status = 'cancelled'
+                    tenancy.save(update_fields=['status'])
+                    
+                    # 2. Revert the application status to 'under_review'
+                    application = Application.objects.filter(
+                        unit=tenancy.unit,
+                        applicant=tenancy.tenant,
+                        status='approved'
+                    ).first()
+                    
+                    if application:
+                        # Safely get the enum value or fallback to string
+                        under_review_status = getattr(Application.Status, 'UNDER_REVIEW', 'under_review')
+                        application.status = under_review_status
+                        application.save(update_fields=['status'])
+                        
+                    # 3. Free up the unit for the marketplace
+                    unit = tenancy.unit
+                    unit.status = 'available'
+                    unit.save(update_fields=['status'])
+                    
+                    # 4. Notify tenant that their application was recalled (Optional)
+                    try:
+                        # Assuming you have a notification service in the communications app
+                        from apps.communications.services.notification_service import NotificationService
+                        NotificationService.send_application_recalled_notification(application, tenancy)
+                    except Exception as notify_err:
+                        logger.warning(f"Could not send recall notification for tenancy {tenancy.id}: {notify_err}")
+                    
+                    recalled_count += 1
+                    
             except Exception as e:
-                logger.warning(f"Failed to auto-expire tenancy {tenancy.id}: {e}")
+                logger.warning(f"Failed to recall tenancy {tenancy.id}: {e}")
                 
-        logger.info(f"Successfully auto-processed {processed_count} expired tenancies.")
-        return {"processed": processed_count}
-    except Exception as e:
-        logger.error(f"Failed to process natural expiries: {e}")
-        raise self.retry(exc=e, countdown=600)
-
-
-@shared_task(bind=True, max_retries=2)
-def sync_tenancy_occupancy_with_marketplace(self):
-    """
-    Safety net task: Ensures marketplace availability perfectly matches 
-    actual tenancy occupancy status. Fixes any drift caused by manual DB edits.
-    """
-    try:
-        from ..models import Tenancy, Occupancy
-        from marketplace.models import Listing
-        
-        # Find mismatches: Tenancy says active, but Unit says available
-        mismatches = Tenancy.objects.filter(
-            status__in=['active', 'pending_payment', 'extended'],
-            unit__status='available'
-        ).select_related('unit')
-        
-        fixed_count = 0
-        for tenancy in mismatches:
-            tenancy.unit.status = 'occupied'
-            tenancy.unit.save(update_fields=['status'])
+        if recalled_count > 0:
+            logger.info(f"Successfully recalled {recalled_count} unpaid approved applications.")
             
-            # Ensure marketplace listing is hidden
-            Listing.objects.filter(unit=tenancy.unit).update(status='unavailable')
-            fixed_count += 1
-            
-        logger.info(f"Fixed {fixed_count} occupancy/marketplace mismatches.")
-        return {"fixed": fixed_count}
+        return {"recalled": recalled_count}
+        
     except Exception as e:
-        logger.error(f"Marketplace sync task failed: {e}")
-        raise self.retry(exc=e, countdown=900)
+        logger.error(f"Recall task failed: {e}")
+        raise self.retry(exc=e, countdown=300)

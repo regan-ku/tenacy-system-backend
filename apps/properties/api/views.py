@@ -180,6 +180,7 @@ class UnitGroupViewSet(viewsets.ModelViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+
 class UnitViewSet(viewsets.ModelViewSet):
     serializer_class = prop_serializers.UnitSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -199,13 +200,25 @@ class UnitViewSet(viewsets.ModelViewSet):
             context['property'] = Property.objects.get(id=self.kwargs.get('property_pk'))
         return context
 
+    # ✅ CRITICAL FIX: Corrected permission logic AND instantiated all permission classes
     def get_permissions(self):
-        if self.action in ['list', 'retrieve'] and not self.request.user.is_authenticated:
-            return [IsMarketplaceReadOnly()]
+        # 1. If the user is NOT logged in (Public Marketplace Browsing)
+        if not self.request.user.is_authenticated:
+            if self.action in ['list', 'retrieve']:
+                return [IsMarketplaceReadOnly()]
+            # Block all other actions (create, update, delete) for public users
+            return [permissions.IsAuthenticated()] # ✅ ADDED () TO INSTANTIATE
         
+        # 2. If the user IS logged in (Tenants, Landlords, Agencies)
+        # Any authenticated user can VIEW units (e.g., a tenant reviewing a unit before applying)
+        if self.action in ['list', 'retrieve']:
+            return [permissions.IsAuthenticated()] # ✅ ADDED () TO INSTANTIATE
+        
+        # 3. Destructive actions require strict ownership
         if self.action == 'destroy':
             return [IsPropertyOwnerOrManager()]
             
+        # 4. Create/Update actions require ownership or delegation
         return [IsOwnerOrDelegated()]
 
     def destroy(self, request, *args, **kwargs):
@@ -225,7 +238,6 @@ class UnitViewSet(viewsets.ModelViewSet):
             return Response({"error": "Status is required."}, status=status.HTTP_400_BAD_REQUEST)
         updated_unit = UnitService.update_unit_status(unit, new_status)
         return Response(prop_serializers.UnitSerializer(updated_unit).data, status=status.HTTP_200_OK)
-
 
 class PropertyMediaViewSet(viewsets.ModelViewSet):
     serializer_class = prop_serializers.PropertyMediaSerializer
