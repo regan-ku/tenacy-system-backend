@@ -7,17 +7,21 @@ from ..services.occupancy_service import OccupancyService
 class TerminationService:
     """
     Manages the formal termination of a tenancy.
-    Ensures proper archival to history and releases the unit back to marketplace availability.
+    Ensures proper archival to history and releases the unit back to marketplace.
     """
 
     @staticmethod
     @transaction.atomic
-    def execute_termination(termination_record: TenancyTermination, approved_by) -> Tenancy:
+    def execute_termination(
+        termination_record: TenancyTermination, 
+        approved_by, 
+        auto_release_unit: bool = True
+    ) -> Tenancy:
         """
-        Executes a termination. 
-        1. Archives current tenancy to history.
-        2. Marks tenancy as terminated.
-        3. Releases unit occupancy (syncs with marketplace).
+        Executes a termination.
+        1. Archives current tenancy to history
+        2. Marks tenancy as terminated
+        3. Releases unit occupancy (syncs with marketplace)
         """
         tenancy = termination_record.tenancy
 
@@ -41,8 +45,9 @@ class TerminationService:
         tenancy.status = Tenancy.Status.TERMINATED
         tenancy.save(update_fields=['status'])
 
-        # 3. Release unit occupancy (This triggers the Marketplace Sync to make the unit available again)
-        OccupancyService.mark_unit_vacant(tenancy.unit, tenancy)
+        # 3. Release unit occupancy (triggers Marketplace Sync)
+        if auto_release_unit:
+            OccupancyService.mark_unit_vacant(tenancy.unit, tenancy)
 
         # 4. Update termination record
         termination_record.approved_by = approved_by
@@ -52,9 +57,45 @@ class TerminationService:
 
     @staticmethod
     @transaction.atomic
+    def execute_direct_manager_termination(
+        tenancy: Tenancy,
+        termination_type: str,
+        notes: str,
+        effective_date,
+        approved_by,
+        penalty_applied=0,
+        auto_release_unit: bool = True
+    ) -> tuple[Tenancy, TenancyTermination]:
+        """
+        For paper-based or manager-initiated terminations that bypass the application system.
+        Creates the TenancyTermination record internally and executes immediately.
+        Ensures identical audit trail to application-based terminations.
+        """
+        # Create internal termination record for audit
+        termination_record = TenancyTermination.objects.create(
+            tenancy=tenancy,
+            termination_type=termination_type,
+            notes=notes or "Manager-initiated termination",
+            penalty_applied=penalty_applied,
+            approved_by=approved_by,
+            effective_date=effective_date
+        )
+        
+        # Execute using existing logic
+        updated_tenancy = TerminationService.execute_termination(
+            termination_record=termination_record,
+            approved_by=approved_by,
+            auto_release_unit=auto_release_unit
+        )
+        
+        return updated_tenancy, termination_record
+
+    @staticmethod
+    @transaction.atomic
     def process_natural_expiry(tenancy: Tenancy):
         """
-        Automatically handles tenancies that have reached their end_date without extension or termination.
+        Automatically handles tenancies that have reached their end_date 
+        without extension or termination.
         Can be run as a daily Celery background task.
         """
         if tenancy.status in [Tenancy.Status.ACTIVE, Tenancy.Status.EXTENDED]:
@@ -73,5 +114,5 @@ class TerminationService:
             tenancy.status = Tenancy.Status.EXPIRED
             tenancy.save(update_fields=['status'])
             
-            # Release unit
+            # ✅ Release unit with bulletproof sync
             OccupancyService.mark_unit_vacant(tenancy.unit, tenancy)

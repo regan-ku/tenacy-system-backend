@@ -22,10 +22,14 @@ class IsPropertyManagerOrOwner(permissions.BasePermission):
         if not property_obj:
             return False
             
+        # Admin always has access
+        if request.user.role == 'admin':
+            return True
+            
+        # Property owner or current manager has access
         return (
             property_obj.created_by == request.user or
-            property_obj.current_manager == request.user or
-            request.user.role == 'admin'
+            property_obj.current_manager == request.user
         )
 
 
@@ -45,18 +49,48 @@ class CanApproveTenancyActions(permissions.BasePermission):
         property_obj = getattr(obj, 'property', None)
         if not property_obj:
             return False
+        
+        user = request.user
             
-        # Admins and Landlords always have access
-        if request.user.role in ['admin', 'landlord'] and property_obj.created_by == request.user:
+        # Admins always have access
+        if user.role == 'admin':
+            return True
+        
+        # Property owner (landlord) has access
+        if property_obj.created_by == user:
+            return True
+        
+        # Current manager has access (could be landlord or agency)
+        if property_obj.current_manager == user:
             return True
             
-        # Check agency/agent delegation
-        if request.user.role in ['agency', 'agent']:
-            DelegatedProperty = apps.get_model('agencies', 'DelegatedProperty')
-            return DelegatedProperty.objects.filter(
-                property_ref=property_obj,
-                agency__staff_members__user=request.user,
-                status='active'
-            ).exists()
+        # Check if user is an agency owner or staff member with delegation
+        if user.role in ['agency', 'agent']:
+            try:
+                Agency = apps.get_model('agencies', 'Agency')
+                DelegatedProperty = apps.get_model('agencies', 'DelegatedProperty')
+                
+                # Check if user owns an agency that has delegation
+                user_agency = Agency.objects.filter(
+                    created_by=user,
+                    delegations__property_ref=property_obj,
+                    delegations__status='active'
+                ).exists()
+                
+                if user_agency:
+                    return True
+                
+                # Check if user is a staff member of an agency with delegation
+                is_delegated_staff = DelegatedProperty.objects.filter(
+                    property_ref=property_obj,
+                    agency__staff_members__user=user,
+                    agency__staff_members__status='active',
+                    status='active'
+                ).exists()
+                
+                return is_delegated_staff
+            except Exception as e:
+                print(f"Error checking agency delegation: {e}")
+                return False
             
         return False

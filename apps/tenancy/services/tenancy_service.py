@@ -60,6 +60,19 @@ class TenancyService:
         # 3. Trigger occupancy update (which syncs with marketplace)
         OccupancyService.mark_unit_occupied(tenancy.unit, tenancy.tenant, tenancy)
 
+        # ✅ 4. CRITICAL: Mark the linked application as 'completed'
+        # This removes it from the Agency Operations grid and registers it under tenancy.
+        from apps.applications.models import Application
+        linked_application = Application.objects.filter(
+            applicant=tenancy.tenant,
+            unit=tenancy.unit,
+            status='approved'  # Only mark approved applications as completed
+        ).first()
+
+        if linked_application:
+            linked_application.status = Application.Status.COMPLETED
+            linked_application.save(update_fields=['status'])
+
         return tenancy
 
     @staticmethod

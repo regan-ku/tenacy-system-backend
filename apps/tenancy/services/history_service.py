@@ -1,6 +1,7 @@
-from django.db.models import Count
+from django.db.models import Count, Q
+from django.db.models.functions import TruncMonth
 from django.utils import timezone
-from ..models import TenancyHistory, TenancyNote
+from ..models import TenancyHistory, TenancyNote, Tenancy
 
 class HistoryService:
     """
@@ -23,13 +24,13 @@ class HistoryService:
         return TenancyHistory.objects.filter(
             tenant=tenant
         ).select_related(
-            'unit', 'property'
+            'unit', 'property', 'unit__unit_group'
         ).order_by('-start_date')[:limit]
 
     @staticmethod
     def get_tenant_history_summary(tenant_id):
         """
-        ✅ NEW: Generates a summary matching the frontend's TenantHistorySummary interface.
+        Generates a summary matching the frontend's TenantHistorySummary interface.
         Safely handles new tenants with no history by returning the expected empty shape.
         """
         from django.contrib.auth import get_user_model
@@ -47,7 +48,7 @@ class HistoryService:
         history = TenancyHistory.objects.filter(tenant=tenant)
         total_past_tenancies = history.count()
 
-        # ✅ CRITICAL: If no history, return the exact shape the frontend expects
+        # If no history, return the exact shape the frontend expects
         if total_past_tenancies == 0:
             return {
                 "total_past_tenancies": 0,
@@ -69,8 +70,11 @@ class HistoryService:
         
         avg_months = round(total_months / valid_tenancies, 1) if valid_tenancies > 0 else 0
 
-        # Simple reliability score based on terminations
-        bad_terminations = history.filter(final_status__in=['breach', 'evicted', 'terminated_by_landlord']).count()
+        # Reliability score based on termination reasons
+        bad_terminations = history.filter(
+            final_status__in=['breach', 'evicted', 'terminated_by_landlord']
+        ).count()
+        
         if bad_terminations == 0:
             score = "Excellent"
         elif bad_terminations <= 1:
@@ -78,9 +82,21 @@ class HistoryService:
         else:
             score = "Fair"
 
-        # Fetch notes linked to the tenant's tenancies
-        notes_qs = TenancyNote.objects.filter(tenancy__tenant=tenant).order_by('-created_at')[:5]
-        notes = [{"note_type": n.note_type, "content": n.content} for n in notes_qs]
+        # Fetch notes linked to the tenant's tenancies (current + historical)
+        # Include notes from both current tenancies and historical records
+        notes_qs = TenancyNote.objects.filter(
+            tenancy__tenant=tenant
+        ).select_related('created_by').order_by('-created_at')[:10]
+        
+        notes = [
+            {
+                "note_type": n.note_type, 
+                "content": n.content,
+                "author": n.created_by.email if n.created_by else "System",
+                "date": n.created_at.strftime('%Y-%m-%d') if n.created_at else ""
+            } 
+            for n in notes_qs
+        ]
 
         return {
             "total_past_tenancies": total_past_tenancies,
@@ -100,3 +116,16 @@ class HistoryService:
             property=property_obj,
             end_date__gte=cutoff
         ).select_related('tenant', 'unit').order_by('-end_date')
+
+    @staticmethod
+    def get_tenant_summary_for_application_review(application_id):
+        """
+        Returns a summary of the applicant's history for use in the application review modal.
+        """
+        from apps.applications.models import Application
+        try:
+            application = Application.objects.select_related('applicant').get(id=application_id)
+        except Application.DoesNotExist:
+            return {}
+        
+        return HistoryService.get_tenant_history_summary(application.applicant.id)

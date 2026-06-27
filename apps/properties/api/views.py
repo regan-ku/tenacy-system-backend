@@ -5,7 +5,7 @@ from rest_framework.permissions import BasePermission
 from django.core.exceptions import ValidationError
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResponse, OpenApiParameter, OpenApiTypes
 
-from django.db.models import Q, Prefetch 
+from django.db.models import Q, Prefetch, Exists, OuterRef 
 from django.contrib.auth import get_user_model
 
 from . import serializers as prop_serializers
@@ -134,21 +134,43 @@ class PropertyViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='tenant-financials', permission_classes=[permissions.IsAuthenticated])
     def tenant_financials(self, request, pk=None):
         property_obj = self.get_object()
-        tenancies = Tenancy.objects.filter(property=property_obj, status='active').select_related('tenant', 'tenant__profile', 'unit')
+        # ✅ ADDED: tenant__profile to select_related for performance & guaranteed access
+        tenancies = Tenancy.objects.filter(
+            property=property_obj, 
+            status='active'
+        ).select_related('tenant', 'tenant__profile', 'unit')
+        
         data = []
         for tenancy in tenancies:
             tenant_user = tenancy.tenant
+            
+            # ✅ CRITICAL FIX: Strictly use Profile full_name. NO email fallback.
+            profile = getattr(tenant_user, 'profile', None)
+            tenant_name = getattr(profile, 'full_name', None) or "Unnamed Tenant"
+            
             nok = NextOfKin.objects.filter(user=tenant_user).first()
             nok_data = {"full_name": nok.full_name, "relationship": nok.relationship, "phone_number": nok.phone_number, "city": nok.city} if nok else None
+            
             data.append({
-                "tenant_id": tenant_user.id, "tenant_name": tenant_user.get_full_name() or tenant_user.email,
-                "tenant_email": tenant_user.email, "tenant_phone": getattr(tenant_user, 'phone_number', ''),
-                "property_name": property_obj.title, "unit_code": tenancy.unit.unit_code if tenancy.unit else "Unassigned",
-                "rent_amount": float(tenancy.rent_amount), "deposit_amount": float(tenancy.deposit_amount),
-                "service_charge": float(tenancy.service_charge_amount), "balance_due": 0, "arrears": 0,
-                "last_payment_date": "", "last_payment_amount": 0, "next_billing_date": "",
-                "tenancy_status": tenancy.status, "tenancy_start_date": str(tenancy.start_date) if hasattr(tenancy, 'start_date') else "",
-                "tenancy_end_date": str(tenancy.end_date) if hasattr(tenancy, 'end_date') else "", "next_of_kin": nok_data
+                "tenancy_id": tenancy.id,  # ✅ ADDED: Needed for notes
+                "tenant_id": tenant_user.id, 
+                "tenant_name": tenant_name, # ✅ Uses Profile full_name strictly
+                "tenant_email": tenant_user.email, 
+                "tenant_phone": getattr(tenant_user, 'phone_number', '') or (getattr(profile, 'phone_number', '') if profile else ''),
+                "property_name": property_obj.title, 
+                "unit_code": tenancy.unit.unit_code if tenancy.unit else "Unassigned",
+                "rent_amount": float(tenancy.rent_amount), 
+                "deposit_amount": float(tenancy.deposit_amount),
+                "service_charge": float(tenancy.service_charge_amount), 
+                "balance_due": 0, 
+                "arrears": 0,
+                "last_payment_date": "", 
+                "last_payment_amount": 0, 
+                "next_billing_date": "",
+                "tenancy_status": tenancy.status, 
+                "tenancy_start_date": str(tenancy.start_date) if hasattr(tenancy, 'start_date') else "",
+                "tenancy_end_date": str(tenancy.end_date) if hasattr(tenancy, 'end_date') else "", 
+                "next_of_kin": nok_data
             })
         return Response(data, status=status.HTTP_200_OK)
 
@@ -180,7 +202,6 @@ class UnitGroupViewSet(viewsets.ModelViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
-
 class UnitViewSet(viewsets.ModelViewSet):
     serializer_class = prop_serializers.UnitSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -192,7 +213,17 @@ class UnitViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         if getattr(self, 'swagger_fake_view', False): return Unit.objects.none()
         property_pk = self.kwargs.get('property_pk')
-        return Unit.objects.filter(property_ref_id=property_pk).select_related('property_ref', 'unit_group')
+        
+        # ✅ CRITICAL FIX: Annotate queryset with active tenancy status
+        # This prevents N+1 query issues when the serializer checks for tenancies
+        active_tenancy = Tenancy.objects.filter(
+            unit=OuterRef('pk'),
+            status__in=['active', 'extended', 'pending_payment']
+        )
+        
+        return Unit.objects.filter(property_ref_id=property_pk).select_related('property_ref', 'unit_group').annotate(
+            has_active_tenancy=Exists(active_tenancy)
+        )
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -207,12 +238,12 @@ class UnitViewSet(viewsets.ModelViewSet):
             if self.action in ['list', 'retrieve']:
                 return [IsMarketplaceReadOnly()]
             # Block all other actions (create, update, delete) for public users
-            return [permissions.IsAuthenticated()] # ✅ ADDED () TO INSTANTIATE
+            return [permissions.IsAuthenticated()] 
         
         # 2. If the user IS logged in (Tenants, Landlords, Agencies)
         # Any authenticated user can VIEW units (e.g., a tenant reviewing a unit before applying)
         if self.action in ['list', 'retrieve']:
-            return [permissions.IsAuthenticated()] # ✅ ADDED () TO INSTANTIATE
+            return [permissions.IsAuthenticated()] 
         
         # 3. Destructive actions require strict ownership
         if self.action == 'destroy':
@@ -238,6 +269,7 @@ class UnitViewSet(viewsets.ModelViewSet):
             return Response({"error": "Status is required."}, status=status.HTTP_400_BAD_REQUEST)
         updated_unit = UnitService.update_unit_status(unit, new_status)
         return Response(prop_serializers.UnitSerializer(updated_unit).data, status=status.HTTP_200_OK)
+
 
 class PropertyMediaViewSet(viewsets.ModelViewSet):
     serializer_class = prop_serializers.PropertyMediaSerializer

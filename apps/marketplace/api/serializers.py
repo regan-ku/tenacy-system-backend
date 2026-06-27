@@ -26,17 +26,19 @@ class UnitGroupAvailabilitySerializer(serializers.ModelSerializer):
 
 class PublicUnitGroupSerializer(serializers.ModelSerializer):
     """
-    ✅ NEW: Lightweight, PUBLIC serializer for Unit Groups.
-    Fetches the group's cover photo from its linked media.
+    ✅ UPDATED: Lightweight, PUBLIC serializer for Unit Groups.
+    Fetches the group's cover photo from its linked media AND real-time availability.
     """
     cover_photo = serializers.SerializerMethodField()
+    # ✅ CRITICAL FIX: Added real-time available units count
+    available_units = serializers.SerializerMethodField() 
 
     class Meta:
         model = UnitGroup
         fields = [
             'id', 'name', 'description', 'unit_type', 'floor_range', 
             'base_rent_amount', 'deposit_amount', 'service_charge', 
-            'billing_cycle', 'capacity', 'cover_photo', 'is_active'
+            'billing_cycle', 'capacity', 'available_units', 'cover_photo', 'is_active'
         ]
 
     def get_cover_photo(self, obj):
@@ -45,6 +47,20 @@ class PublicUnitGroupSerializer(serializers.ModelSerializer):
         if first_media and first_media.file:
             return first_media.file.url
         return None
+
+    # ✅ NEW: Fetch real-time available units from the tracking model
+    def get_available_units(self, obj):
+        """
+        Fetches the real-time available units count from the UnitGroupAvailability 
+        tracking model. Falls back to total capacity if no record exists yet.
+        """
+        availability = UnitGroupAvailability.objects.filter(unit_group=obj).first()
+        
+        if availability:
+            return availability.available_units
+        
+        # Fallback: If the sync service hasn't created a record yet, assume all are available
+        return obj.capacity
 
 
 class ListingSerializer(serializers.ModelSerializer):
@@ -151,11 +167,10 @@ class ListingDetailSerializer(serializers.ModelSerializer):
             return []
         
         groups = property_obj.unit_groups.filter(is_active=True, capacity__gt=0)
+        # ✅ This now uses the updated PublicUnitGroupSerializer which includes available_units
         return PublicUnitGroupSerializer(groups, many=True).data
 
-    # ✅ NEW: Fetches ALL property media (Frontend will separate it into main vs grouped)
-        # ✅ NEW: Fetches ALL property media (Frontend will separate it into main vs grouped)
-        # ✅ UPDATED: Fetches ALL property media EXCEPT sensitive documents
+    # ✅ UPDATED: Fetches ALL property media EXCEPT sensitive documents
     def get_property_media(self, obj):
         property_obj = getattr(obj, 'property', None)
         if not property_obj: 

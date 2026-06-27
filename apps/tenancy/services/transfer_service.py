@@ -25,13 +25,10 @@ class TransferService:
 
     @staticmethod
     @transaction.atomic
-    def execute_transfer(transfer_request: TenancyTransfer, approved_by) -> Tenancy:
+    def execute_transfer(transfer_request: TenancyTransfer, approved_by, auto_activate: bool = False) -> Tenancy:
         """
         Executes an approved transfer request.
-        1. Terminates old tenancy.
-        2. Releases old unit to marketplace.
-        3. Creates new tenancy for destination unit.
-        4. Occupies new unit (removes from marketplace).
+        ✅ UPDATED: auto_activate defaults to False to enforce the "wait for payment/waiver" rule.
         """
         # 1. Validate same management rule
         TransferService.validate_same_management(transfer_request.from_property, transfer_request.to_property)
@@ -45,7 +42,7 @@ class TransferService:
             tenant=transfer_request.tenant,
             unit=transfer_request.from_unit,
             status__in=['active', 'extended', 'pending_payment']
-        ).first()
+        ).select_related('unit', 'property').first()
 
         if not old_tenancy:
             raise ValidationError("No active tenancy found for the source unit.")
@@ -66,6 +63,8 @@ class TransferService:
         # 5. Mark old tenancy as transferred and release old unit
         old_tenancy.status = Tenancy.Status.TRANSFERRED
         old_tenancy.save(update_fields=['status'])
+        
+        # ✅ Explicitly release occupancy
         OccupancyService.mark_unit_vacant(transfer_request.from_unit, old_tenancy)
 
         # 6. Create new tenancy for destination unit
@@ -74,22 +73,18 @@ class TransferService:
             unit=transfer_request.to_unit,
             property_obj=transfer_request.to_property,
             created_by=approved_by,
-            rent_amount=transfer_request.to_unit.rent_amount, # Use new unit's pricing
+            rent_amount=transfer_request.to_unit.rent_amount,
             deposit_amount=transfer_request.to_unit.deposit_amount,
             service_charge_amount=transfer_request.to_unit.service_charge,
             tenancy_type=old_tenancy.tenancy_type,
             start_date=timezone.now().date(),
-            end_date=old_tenancy.end_date # Carry over original end date, or adjust as needed
+            end_date=old_tenancy.end_date
         )
 
-        # 7. If the old tenancy was fully paid/waived, we can auto-activate the new one 
-        # (assuming deposit/service charge logic carries over, otherwise it stays pending_payment)
-        if old_tenancy.is_ready_for_activation():
-            # For simplicity in transfer, we assume financial obligations are settled or carried over
-            new_tenancy.deposit_paid = old_tenancy.deposit_paid or old_tenancy.deposit_waived
-            new_tenancy.service_charge_paid = old_tenancy.service_charge_paid or old_tenancy.service_charge_waived
-            new_tenancy.save(update_fields=['deposit_paid', 'service_charge_paid'])
-            
+        # ✅ CRITICAL: DO NOT carry over payment status automatically.
+        # The new tenancy must remain 'pending_payment' until the manager applies waivers 
+        # or the tenant pays for the new unit, enforcing the unified business rule.
+        if auto_activate and new_tenancy.is_ready_for_activation():
             TenancyService.activate_tenancy(new_tenancy, activated_by=approved_by)
 
         # 8. Update transfer request status
@@ -99,3 +94,39 @@ class TransferService:
         transfer_request.save(update_fields=['transfer_status', 'approved_by', 'processed_at'])
 
         return new_tenancy
+
+    @staticmethod
+    @transaction.atomic
+    def execute_direct_manager_transfer(
+        tenant, from_unit, to_unit, reason, approved_by, auto_activate: bool = False
+    ) -> tuple[Tenancy, TenancyTransfer]:
+        """
+        For paper-based or manager-initiated transfers that bypass the application system.
+        ✅ UPDATED: auto_activate defaults to False
+        """
+        from apps.properties.models import Unit
+        from ..models import TenancyTransfer
+        
+        from_unit_obj = Unit.objects.select_related('property').get(id=from_unit.id if hasattr(from_unit, 'id') else from_unit)
+        to_unit_obj = Unit.objects.select_related('property').get(id=to_unit.id if hasattr(to_unit, 'id') else to_unit)
+        
+        transfer_record = TenancyTransfer.objects.create(
+            tenant=tenant,
+            from_property=from_unit_obj.property,
+            from_unit=from_unit_obj,
+            to_property=to_unit_obj.property,
+            to_unit=to_unit_obj,
+            reason=reason or "Manager-initiated transfer",
+            requested_by=approved_by,
+            transfer_status='approved',
+            approved_by=approved_by,
+            processed_at=timezone.now()
+        )
+        
+        new_tenancy = TransferService.execute_transfer(
+            transfer_request=transfer_record,
+            approved_by=approved_by,
+            auto_activate=auto_activate
+        )
+        
+        return new_tenancy, transfer_record

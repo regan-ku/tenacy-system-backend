@@ -1,5 +1,5 @@
 from django.db import transaction
-from ..models import Listing
+from ..models import Listing, UnitGroupAvailability
 from apps.properties.models import Property, Unit
 
 class MarketplaceSyncService:
@@ -29,19 +29,47 @@ class MarketplaceSyncService:
     def sync_unit_occupancy(unit: Unit):
         """
         Called when a unit's status changes (e.g., available -> occupied).
-        Updates the specific unit listing and triggers unit group availability checks.
+        Updates the UnitGroupAvailability and toggles the Listing visibility.
         """
-        from .availability_service import AvailabilityService
+        # ✅ FIX: Listings are tied to unit_group or property, NOT individual units.
+        # Filtering by unit=unit causes a FieldError or silent failure.
         
-        # 1. Update the specific unit listing
-        if unit.status == 'occupied':
-            Listing.objects.filter(unit=unit, status='active').update(status='unavailable')
+        if not unit.unit_group:
+            # Single unit property (no group) -> toggle property-level listing
+            property_obj = getattr(unit, 'property_ref', None) or getattr(unit, 'property', None)
+            if property_obj:
+                if unit.status == 'occupied':
+                    Listing.objects.filter(property=property_obj, status='active').update(status='unavailable')
+                else:
+                    Listing.objects.filter(property=property_obj, status='unavailable').update(status='active')
+            return
+
+        # 1. Get or create UnitGroupAvailability
+        availability, created = UnitGroupAvailability.objects.get_or_create(
+            unit_group=unit.unit_group,
+            defaults={
+                'total_units': unit.unit_group.capacity,
+                'available_units': unit.unit_group.capacity,
+                'occupied_units': 0
+            }
+        )
+
+        # ✅ FIX: Recalculate availability based on ACTUAL unit statuses to prevent drift.
+        # This guarantees the marketplace number is always 100% accurate.
+        occupied_count = Unit.objects.filter(unit_group=unit.unit_group, status='occupied').count()
+        total_capacity = unit.unit_group.capacity
+        
+        availability.occupied_units = occupied_count
+        availability.available_units = max(0, total_capacity - occupied_count)
+        availability.save()
+
+        # 2. Toggle the Listing visibility (Listing is tied to unit_group)
+        if availability.available_units == 0:
+            # All units in this group are occupied -> Hide the listing
+            Listing.objects.filter(unit_group=unit.unit_group, status='active').update(status='unavailable')
         else:
-            Listing.objects.filter(unit=unit, status='unavailable').update(status='active')
-            
-        # 2. Sync the parent unit group availability (hides group if 0 units left)
-        if unit.unit_group:
-            AvailabilityService.mark_unit_occupied(unit) if unit.status == 'occupied' else AvailabilityService.mark_unit_available(unit)
+            # At least one unit is available -> Show the listing
+            Listing.objects.filter(unit_group=unit.unit_group, status='unavailable').update(status='active')
 
     @staticmethod
     @transaction.atomic
@@ -50,8 +78,5 @@ class MarketplaceSyncService:
         Called when a property is first published or significantly updated.
         Ensures Listing records exist and are synced with current unit availability.
         """
-        from .listing_service import ListingService # Avoid circular import by importing locally if needed, or handle via service
-        
-        # This is a heavy operation, typically triggered by a background task
-        # For now, it ensures that if a property is published, its available units get listing records
-        pass # Implementation handled by publishing_service.py triggers
+        # Implementation handled by publishing_service.py triggers
+        pass 

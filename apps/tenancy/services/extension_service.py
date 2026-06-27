@@ -1,8 +1,7 @@
 from django.db import transaction
 from django.core.exceptions import ValidationError
 from django.utils import timezone
-from ..models import TenancyExtension, Tenancy
-from ..utils.tenancy_utils import TenancyUtils
+from ..models import TenancyExtension, Tenancy, TenancyNote
 
 class ExtensionService:
     """
@@ -13,7 +12,8 @@ class ExtensionService:
     @transaction.atomic
     def approve_extension(extension_request: TenancyExtension, approved_by) -> Tenancy:
         """
-        Approves an extension request, updates the tenancy end date, and adjusts rent if specified.
+        Approves an extension request, updates the tenancy end date, 
+        and adjusts rent if specified.
         """
         if extension_request.status != 'pending':
             raise ValidationError("Only pending extension requests can be approved.")
@@ -29,7 +29,7 @@ class ExtensionService:
         tenancy.end_date = extension_request.requested_new_end_date
         
         # Apply rent adjustment if proposed and approved
-        if extension_request.proposed_rent_adjustment > 0:
+        if extension_request.proposed_rent_adjustment and extension_request.proposed_rent_adjustment != 0:
             tenancy.rent_amount += extension_request.proposed_rent_adjustment
             update_fields.append('rent_amount')
             
@@ -46,12 +46,11 @@ class ExtensionService:
         extension_request.processed_at = timezone.now()
         extension_request.save(update_fields=['status', 'approved_by', 'processed_at'])
 
-        # 4. Log the extension
-        from ..models import TenancyNote
+        # 4. Log the extension as a tenancy note for audit trail
         TenancyNote.objects.create(
             tenancy=tenancy,
             note_type='general',
-            content=f"Tenancy extended to {tenancy.end_date}. Rent adjusted by {extension_request.proposed_rent_adjustment}.",
+            content=f"Tenancy extended to {tenancy.end_date}. Rent adjusted by {extension_request.proposed_rent_adjustment or 0}.",
             created_by=approved_by
         )
 
@@ -59,7 +58,11 @@ class ExtensionService:
 
     @staticmethod
     @transaction.atomic
-    def reject_extension(extension_request: TenancyExtension, approved_by, reason: str = "") -> TenancyExtension:
+    def reject_extension(
+        extension_request: TenancyExtension, 
+        approved_by, 
+        reason: str = ""
+    ) -> TenancyExtension:
         """
         Rejects an extension request.
         """
@@ -71,4 +74,50 @@ class ExtensionService:
         extension_request.processed_at = timezone.now()
         extension_request.save(update_fields=['status', 'approved_by', 'processed_at'])
 
+        # Log the rejection as a tenancy note
+        TenancyNote.objects.create(
+            tenancy=extension_request.tenancy,
+            note_type='general',
+            content=f"Extension request rejected. Reason: {reason or 'Not specified'}",
+            created_by=approved_by
+        )
+
         return extension_request
+
+    @staticmethod
+    @transaction.atomic
+    def execute_direct_manager_extension(
+        tenancy: Tenancy,
+        new_end_date,
+        reason: str,
+        approved_by,
+        rent_adjustment=0
+    ) -> tuple[Tenancy, TenancyExtension]:
+        """
+        For paper-based or manager-initiated extensions that bypass the application system.
+        Creates the TenancyExtension record internally and executes immediately.
+        Ensures identical audit trail to application-based extensions.
+        """
+        # Validate the new end date is in the future
+        if new_end_date <= timezone.now().date():
+            raise ValidationError("New end date must be in the future.")
+        
+        # Create internal extension record for audit
+        extension_record = TenancyExtension.objects.create(
+            tenancy=tenancy,
+            requested_new_end_date=new_end_date,
+            proposed_rent_adjustment=rent_adjustment,
+            reason=reason or "Manager-initiated extension",
+            requested_by=approved_by,
+            status='approved',  # Pre-approved
+            approved_by=approved_by,
+            processed_at=timezone.now()
+        )
+        
+        # Execute using existing logic
+        updated_tenancy = ExtensionService.approve_extension(
+            extension_request=extension_record,
+            approved_by=approved_by
+        )
+        
+        return updated_tenancy, extension_record

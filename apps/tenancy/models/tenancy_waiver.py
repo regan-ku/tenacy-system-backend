@@ -3,18 +3,21 @@ from django.conf import settings
 
 class TenancyWaiver(models.Model):
     """
-    Records formal approvals for waiving deposits or service charges.
+    Records formal approvals for waiving deposits, service charges, or rent.
     Ensures financial exceptions are properly authorized and audited.
     """
+    # ✅ UPDATED: Added RENT, removed BOTH (system creates individual records)
     class WaiverType(models.TextChoices):
+        RENT = 'rent', 'Rent Waiver'
         DEPOSIT = 'deposit', 'Deposit Waiver'
         SERVICE_CHARGE = 'service_charge', 'Service Charge Waiver'
-        BOTH = 'both', 'Both Deposit and Service Charge'
 
+    # ✅ UPDATED: Added REVOKED status to support the revoke_waiver endpoint
     class Status(models.TextChoices):
         PENDING = 'pending', 'Pending Approval'
         APPROVED = 'approved', 'Approved'
         REJECTED = 'rejected', 'Rejected'
+        REVOKED = 'revoked', 'Revoked' 
 
     tenancy = models.ForeignKey(
         'Tenancy',
@@ -50,11 +53,12 @@ class TenancyWaiver(models.Model):
         help_text="Manager, landlord, or admin who approved the waiver."
     )
 
+    # ✅ UPDATED: Default changed to APPROVED since managers apply them directly via the UI
     status = models.CharField(
         'Status',
         max_length=20,
         choices=Status.choices,
-        default=Status.PENDING
+        default=Status.APPROVED 
     )
 
     requested_at = models.DateTimeField(auto_now_add=True)

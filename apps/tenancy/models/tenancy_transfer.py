@@ -46,6 +46,21 @@ class TenancyTransfer(models.Model):
 
     reason = models.TextField('Reason for Transfer', blank=True, null=True)
     
+    # ✅ NEW FIELDS: Move-in date and manager notes
+    requested_move_in_date = models.DateField(
+        'Requested Move-in Date',
+        null=True,
+        blank=True,
+        help_text="When the tenant wants to move into the new unit."
+    )
+    
+    manager_notes = models.TextField(
+        'Manager Notes',
+        blank=True,
+        null=True,
+        help_text="Additional notes from the requesting manager/agent for the approving manager."
+    )
+    
     transfer_status = models.CharField(
         'Transfer Status',
         max_length=20,

@@ -15,7 +15,7 @@ class TenancyTermination(models.Model):
 
     tenancy = models.OneToOneField(
         'Tenancy',
-        on_delete=models.PROTECT, # Protect to preserve the termination record even if tenancy is archived
+        on_delete=models.PROTECT,
         related_name='termination_record',
         help_text="The tenancy being terminated."
     )
@@ -49,6 +49,7 @@ class TenancyTermination(models.Model):
         help_text="Manager, landlord, or admin who approved the termination."
     )
 
+    # ✅ KEPT AS effective_date for legal/DB clarity
     effective_date = models.DateField(
         'Effective Termination Date',
         help_text="The date the unit is officially vacated and released."
@@ -66,3 +67,18 @@ class TenancyTermination(models.Model):
 
     def __str__(self):
         return f"Termination of {self.tenancy.unit.unit_code} ({self.get_termination_type_display()})"
+
+    # ✅ NEW: Property alias for frontend/API consistency
+    @property
+    def move_out_date(self):
+        """
+        Alias for effective_date.
+        Used by serializers/frontend for user-friendly naming.
+        'Move out date' and 'effective date' are the same thing in this context.
+        """
+        return self.effective_date
+
+    @move_out_date.setter
+    def move_out_date(self, value):
+        """Allows setting via the alias."""
+        self.effective_date = value

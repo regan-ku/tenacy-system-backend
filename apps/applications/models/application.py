@@ -19,8 +19,9 @@ class Application(models.Model):
         REJECTED = 'rejected', 'Rejected'
         CANCELLED = 'cancelled', 'Cancelled'
         EXPIRED = 'expired', 'Expired'
+        # ✅ NEW: Completed status for applications converted to active tenancies
+        COMPLETED = 'completed', 'Completed (Converted to Tenancy)'
 
-    # Auto-populated from Accounts App
     applicant = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
@@ -28,7 +29,6 @@ class Application(models.Model):
         help_text="The user submitting the application."
     )
 
-    # Auto-populated from Properties App
     property = models.ForeignKey(
         'properties.Property',
         on_delete=models.PROTECT,

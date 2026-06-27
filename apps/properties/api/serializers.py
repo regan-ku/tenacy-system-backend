@@ -5,6 +5,9 @@ from ..models import Property, Location, UnitGroup, Unit, PropertyMedia
 from ..models.enums import PropertyCategory, PropertySubType, UnitType, UnitStatus, BillingCycle, ConstructionType
 from ..services import PropertyService, UnitGroupService, UnitService, LocationService, MediaService
 
+# ✅ ADDED IMPORT: Needed to dynamically check for active tenancies
+from apps.tenancy.models.tenancy import Tenancy 
+
 
 class LocationSerializer(serializers.ModelSerializer):
     class Meta:
@@ -43,6 +46,10 @@ class PropertySerializer(serializers.ModelSerializer):
 
     landlord_name = serializers.SerializerMethodField()
     delegation_info = serializers.SerializerMethodField()
+    
+    # ✅ NEW: Occupancy rate calculation
+    occupancy_rate = serializers.SerializerMethodField()
+    total_units = serializers.SerializerMethodField()
 
     class Meta:
         model = Property
@@ -54,9 +61,9 @@ class PropertySerializer(serializers.ModelSerializer):
             'has_cctv', 'has_elevator', 'has_generator', 'has_gym', 'has_swimming_pool', 
             'listing_type', 'is_published', 'allows_pets', 'parking_spaces',
             'location', 'is_active', 'location_details', 
-            'landlord_name', 'delegation_info'
+            'landlord_name', 'delegation_info', 'occupancy_rate', 'total_units'
         ]
-        read_only_fields = ['id', 'created_by_email', 'is_active', 'location_details', 'landlord_name', 'delegation_info']
+        read_only_fields = ['id', 'created_by_email', 'is_active', 'location_details', 'landlord_name', 'delegation_info', 'occupancy_rate', 'total_units']
 
     @extend_schema_field(LocationSerializer)
     def get_location_details(self, obj):
@@ -83,6 +90,31 @@ class PropertySerializer(serializers.ModelSerializer):
             }
         return None
 
+    # ✅ NEW: Calculate total actual units in the property
+    def get_total_units(self, obj):
+        """Returns the actual number of units created in this property."""
+        return obj.units.count()
+
+    # ✅ NEW: Calculate occupancy rate from Tenancy model
+    def get_occupancy_rate(self, obj):
+        """
+        Calculates the occupancy rate by querying the Tenancy model.
+        Returns a percentage (0-100) rounded to 1 decimal place.
+        """
+        total_units = obj.units.count()
+        
+        if total_units == 0:
+            return 0
+        
+        # Count units with active tenancies
+        occupied_units = obj.units.filter(
+            tenancies__status__in=['active', 'extended', 'pending_payment']
+        ).distinct().count()
+        
+        # Calculate percentage
+        rate = (occupied_units / total_units) * 100
+        return round(rate, 1)
+
     def create(self, validated_data):
         user = self.context['request'].user
         location_data = validated_data.pop('location', {})
@@ -93,36 +125,27 @@ class PropertySerializer(serializers.ModelSerializer):
         )
 
     def update(self, instance, validated_data):
-        # 🔍 DEBUG: See exactly what keys the frontend sent
-        print(f"🔥 [PropertySerializer] UPDATE CALLED! Keys received: {list(validated_data.keys())}")
-        
         user = self.context['request'].user
         
         if 'location' in validated_data:
-            print(f"📍 [PropertySerializer] Location data found: {validated_data['location']}")
             location_data = validated_data.pop('location')
             if location_data and instance.location: 
-                print(f"🛠️ [PropertySerializer] Calling LocationService for instance {instance.location.id}")
                 LocationService.create_or_update_location(location_data, instance=instance.location)
             elif location_data and not instance.location:
-                print(f"🆕 [PropertySerializer] Creating new location")
                 instance.location = LocationService.create_or_update_location(location_data)
                 instance.save(update_fields=['location'])
-        else:
-            print("⚠️ [PropertySerializer] NO LOCATION DATA IN VALIDATED_DATA! The frontend didn't send the 'location' key.")
             
         return PropertyService.update_property(instance, user, validated_data)
 
 
-# ... (Keep UnitGroupSerializer, UnitSerializer, and PropertyMediaSerializer exactly as they are) ...
-
-
+# ✅ UPDATED: UnitGroupSerializer now includes occupancy stats
 class UnitGroupSerializer(serializers.ModelSerializer):
     unit_type = serializers.ChoiceField(choices=UnitType.choices)
     billing_cycle = serializers.ChoiceField(choices=BillingCycle.choices)
     
-    # ✅ NEW: Real-time count of actual units generated in this group
     actual_units_count = serializers.SerializerMethodField()
+    occupied_units = serializers.SerializerMethodField()
+    available_units = serializers.SerializerMethodField()
 
     class Meta:
         model = UnitGroup
@@ -131,7 +154,7 @@ class UnitGroupSerializer(serializers.ModelSerializer):
             'billing_cycle', 'billing_date', 'base_rent_amount',  
             'service_charge', 'deposit_amount', 'currency', 'capacity', 
             'allows_pets_override', 'is_active', 'cover_photo',
-            'actual_units_count' # ✅ Added to fields list
+            'actual_units_count', 'occupied_units', 'available_units'
         ]
         extra_kwargs = {
             'name': {'help_text': "e.g., 'Block A', 'Wing 1'."},
@@ -142,6 +165,21 @@ class UnitGroupSerializer(serializers.ModelSerializer):
     def get_actual_units_count(self, obj):
         """Returns the exact number of units currently existing in this group."""
         return obj.units.count()
+
+    def get_occupied_units(self, obj):
+        """
+        ✅ SOURCE OF TRUTH: Queries the Tenancy app for active tenancies
+        to determine how many units in this group are currently occupied.
+        """
+        return obj.units.filter(
+            tenancies__status__in=['active', 'extended', 'pending_payment']
+        ).distinct().count()
+
+    def get_available_units(self, obj):
+        """Calculates available units by subtracting occupied from total actual units."""
+        total = self.get_actual_units_count(obj)
+        occupied = self.get_occupied_units(obj)
+        return max(0, total - occupied)
 
     def create(self, validated_data):
         property_obj = self.context['property']
@@ -173,7 +211,8 @@ class UnitSerializer(serializers.ModelSerializer):
     parking_spaces = serializers.SerializerMethodField()
     currency = serializers.SerializerMethodField()
     
-    status = serializers.ChoiceField(choices=UnitStatus.choices, required=False)
+    # ✅ CRITICAL FIX: Override status to dynamically check for active tenancies
+    status = serializers.SerializerMethodField()
 
     class Meta:
         model = Unit
@@ -206,6 +245,24 @@ class UnitSerializer(serializers.ModelSerializer):
 
     def get_currency(self, obj):
         return obj.unit_group.currency if obj.unit_group else 'KES'
+
+    # ✅ CRITICAL FIX: Dynamically return 'occupied' if an active tenancy exists
+    def get_status(self, obj):
+        """
+        Dynamically checks the Tenancy model to ensure the frontend always 
+        sees the ground truth, even if the database Unit.status column is stale.
+        """
+        # 1. Use the annotated field if available (prevents N+1 queries)
+        if hasattr(obj, 'has_active_tenancy'):
+            return 'occupied' if obj.has_active_tenancy else obj.status
+        
+        # 2. Fallback: Direct DB query (only happens if annotation is missing)
+        has_active = Tenancy.objects.filter(
+            unit=obj, 
+            status__in=['active', 'extended', 'pending_payment']
+        ).exists()
+        
+        return 'occupied' if has_active else obj.status
 
     def create(self, validated_data):
         property_obj = self.context.get('property')

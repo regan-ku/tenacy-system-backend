@@ -5,26 +5,50 @@ from .tenancy_condition_service import TenancyConditionService
 from ..utils.scoring_engine import ScoringEngine
 from ..utils.risk_analyzer import RiskAnalyzer
 from .screening_service import ScreeningService
+from apps.tenancy.models import Tenancy
 
 class ApprovalService:
     """
     Evaluates application conditions and automatically routes the decision workflow.
+    Now fully supports Rental, Transfer, and Termination applications.
     """
 
     @staticmethod
     def evaluate_and_route(application: Application, reviewer) -> str:
-        if application.application_type == Application.ApplicationType.RENTAL:
+        app_type = getattr(application, 'application_type', None)
+        
+        is_rental = app_type in ['rental', getattr(Application.ApplicationType, 'RENTAL', None)]
+        is_transfer = app_type in ['transfer', getattr(Application.ApplicationType, 'TRANSFER', None)]
+        is_termination = app_type in ['termination', getattr(Application.ApplicationType, 'TERMINATION', None)]
+
+        if is_rental:
             conditions = TenancyConditionService.validate_rental_conditions(
                 application.unit, application.applicant
             )
-        elif application.application_type == Application.ApplicationType.TRANSFER:
+        elif is_transfer:
             transfer_details = getattr(application, 'transfer_details', None) or getattr(application, 'transfer_application', None)
             if not transfer_details:
                 return 'escalate'
                 
             conditions = TenancyConditionService.validate_transfer_conditions(
-                transfer_details.from_unit, transfer_details.to_unit, application.applicant
+                getattr(transfer_details, 'from_unit', None), 
+                getattr(transfer_details, 'to_unit', None), 
+                application.applicant
             )
+        elif is_termination:
+            # For terminations, we just check if an active tenancy exists for this tenant.
+            tenancy = Tenancy.objects.filter(
+                tenant=application.applicant, 
+                status__in=[getattr(Tenancy.Status, 'ACTIVE', 'active'), 'active']
+            ).first()
+            
+            if not tenancy:
+                return 'escalate'
+                
+            conditions = {
+                "all_conditions_met": True,
+                "has_blocking_flags": False
+            }
         else:
             return 'escalate' 
 
@@ -39,6 +63,7 @@ class ApprovalService:
         if decision not in valid_decisions:
             raise ValidationError(f"Invalid decision. Must be one of: {valid_decisions}")
 
+        # Agents can only approve if all conditions are met
         if reviewer.role == 'agent' and decision == 'approved':
             required_action = ApprovalService.evaluate_and_route(application, reviewer)
             if required_action == 'escalate':
@@ -46,7 +71,7 @@ class ApprovalService:
                     "Agent approval denied: Not all tenancy conditions are met. This application must be escalated to a Manager."
                 )
 
-        # ✅ FIX: Safely handle status mapping in case the model uses strings instead of Enums
+        # Safely handle status mapping
         status_map = {
             'approved': getattr(Application.Status, 'APPROVED', 'approved'),
             'rejected': getattr(Application.Status, 'REJECTED', 'rejected'),
@@ -63,7 +88,6 @@ class ApprovalService:
             reason=reason
         )
 
-        # ✅ FIX: Safely get NoteType enum if it exists, otherwise fallback to string
         note_type_enum = getattr(ApplicationNote.NoteType, 'ESCALATION_REASON', 'escalation_reason') if decision == 'escalated' else getattr(ApplicationNote.NoteType, 'MANAGER_REMARK', 'manager_remark')
         
         ApplicationNote.objects.create(
@@ -73,8 +97,8 @@ class ApprovalService:
             created_by=reviewer
         )
 
+        # ✅ CRITICAL: Trigger integration upon approval
         if decision == 'approved':
-            # ✅ CRITICAL FIX: Corrected the spelling of the import
             from .tennacy_intergration_service import TenancyIntegrationService
             try:
                 TenancyIntegrationService.execute_approved_application(application)
@@ -87,16 +111,25 @@ class ApprovalService:
     def get_reviewer_context(application: Application, reviewer) -> dict:
         screening_profile = ScreeningService.get_tenant_screening_profile(application.applicant, reviewer)
         
-        if application.application_type == Application.ApplicationType.RENTAL:
+        app_type = getattr(application, 'application_type', None)
+        is_rental = app_type in ['rental', getattr(Application.ApplicationType, 'RENTAL', None)]
+        is_transfer = app_type in ['transfer', getattr(Application.ApplicationType, 'TRANSFER', None)]
+        is_termination = app_type in ['termination', getattr(Application.ApplicationType, 'TERMINATION', None)]
+
+        if is_rental:
             conditions = TenancyConditionService.validate_rental_conditions(application.unit, application.applicant)
-        elif application.application_type == Application.ApplicationType.TRANSFER:
+        elif is_transfer:
             transfer_details = getattr(application, 'transfer_details', None) or getattr(application, 'transfer_application', None)
             if transfer_details:
                 conditions = TenancyConditionService.validate_transfer_conditions(
-                    transfer_details.from_unit, transfer_details.to_unit, application.applicant
+                    getattr(transfer_details, 'from_unit', None), 
+                    getattr(transfer_details, 'to_unit', None), 
+                    application.applicant
                 )
             else:
                 conditions = {}
+        elif is_termination:
+            conditions = {"all_conditions_met": True, "has_blocking_flags": False}
         else:
             conditions = {}
 
