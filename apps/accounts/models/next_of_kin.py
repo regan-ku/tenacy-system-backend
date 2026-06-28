@@ -43,7 +43,6 @@ class NextOfKin(models.Model):
     class Meta:
         verbose_name = 'Next of Kin'
         verbose_name_plural = 'Next of Kin Contacts'
-        # Ensure we can quickly fetch the primary contact without N+1 queries
         indexes = [
             models.Index(fields=['user', 'is_primary']),
         ]
@@ -54,7 +53,6 @@ class NextOfKin(models.Model):
     def save(self, *args, **kwargs):
         """
         Ensure only ONE primary contact exists per user.
-        If this is set to primary, unset any existing primary contacts for this user.
         """
         if self.is_primary:
             NextOfKin.objects.filter(user=self.user, is_primary=True).exclude(pk=self.pk).update(is_primary=False)

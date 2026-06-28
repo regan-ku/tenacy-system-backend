@@ -1,4 +1,5 @@
 import json
+import secrets
 from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -9,6 +10,70 @@ class UserService:
     """
     Core business logic for user lifecycle management, state resolution, and role upgrades.
     """
+
+    @staticmethod
+    @transaction.atomic
+    def create_tenant_for_manager(manager_user: User, payload: dict) -> dict:
+        """
+        Creates a new Tenant user, Profile, and NextOfKin on behalf of a manager.
+        Generates a temporary password and flags the user to change it on first login.
+        Returns a dict with the 'user' and the plain-text 'temp_password' for notifications.
+        """
+        tenant_data = payload.get('tenant_data', {})
+        profile_data = payload.get('profile_data', {})
+        nok_data = payload.get('next_of_kin_data', {})
+
+        email = tenant_data.get('email')
+        phone = tenant_data.get('phone_number') or tenant_data.get('phone')
+
+        if not email:
+            raise ValidationError("Email is required to create a tenant account.")
+
+        # Prevent duplicate accounts
+        if User.objects.filter(email=email).exists():
+            raise ValidationError(f"A user with the email {email} already exists.")
+        if phone and User.objects.filter(phone_number=phone).exists():
+            raise ValidationError(f"A user with the phone number {phone} already exists.")
+
+        # Generate a secure temporary password
+        temp_password = f"Temp{secrets.token_urlsafe(8)}!"
+
+        # 1. Create the User Account
+        new_tenant = User.objects.create_user(
+            email=email,
+            password=temp_password,
+            phone_number=phone,
+            role=User.Role.TENANT,
+            is_verified=False, # Tenants do not require identity verification
+            requires_password_change=True # Force password change on first login
+        )
+
+        # 2. Create the Profile
+        Profile.objects.create(
+            user=new_tenant,
+            full_name=profile_data.get('full_name', ''),
+            national_id=profile_data.get('national_id') or profile_data.get('id_number'),
+            nationality=profile_data.get('nationality', ''),
+            address=profile_data.get('address', ''),
+            date_of_birth=profile_data.get('date_of_birth'),
+            profile_complete=True # Manager completed it on their behalf
+        )
+
+        # 3. Create Next of Kin (if provided)
+        if nok_data.get('full_name'):
+            NextOfKin.objects.create(
+                user=new_tenant,
+                full_name=nok_data.get('full_name'),
+                relationship=nok_data.get('relationship', 'other'),
+                phone_number=nok_data.get('phone_number') or nok_data.get('phone', ''),
+                city=nok_data.get('city', ''),
+                is_primary=True
+            )
+
+        return {
+            "user": new_tenant,
+            "temp_password": temp_password
+        }
 
     @staticmethod
     def get_user_state(user: User) -> dict:
@@ -69,7 +134,6 @@ class UserService:
                 }
 
             # B. Check for APPROVED applications (Ready to move in / finalize)
-            # If they have an approved application, they MUST go to the dashboard to see the badge.
             has_approved_application = Application.objects.filter(
                 applicant=user,
                 status='approved'
@@ -220,8 +284,6 @@ class UserService:
             "next_route": f"/dashboard/{user.role}",
             "message": "Welcome to your operational dashboard."
         }
-
-    # ... (Keep complete_onboarding, request_role_upgrade, update_profile, add_next_of_kin exactly as they were) ...
 
     @staticmethod
     @transaction.atomic

@@ -21,6 +21,7 @@ class UserManager(BaseUserManager):
         extra_fields.setdefault('is_staff', True)
         extra_fields.setdefault('is_superuser', True)
         extra_fields.setdefault('is_active', True)
+        extra_fields.setdefault('role', 'admin') # Ensure superuser gets admin role
 
         if extra_fields.get('is_staff') is not True:
             raise ValueError('Superuser must have is_staff=True.')
@@ -43,7 +44,7 @@ class User(AbstractUser):
         CARETAKER = 'caretaker', 'Property Caretaker'
         TENANT = 'tenant', 'Tenant'
 
-    # Override username to make email the primary identifier for better maintainance
+    # Override username to make email the primary identifier
     username = None 
     
     email = models.EmailField(
@@ -52,14 +53,12 @@ class User(AbstractUser):
         validators=[validate_strict_email]
     )
     
-    # ✅ UPDATED: Renamed from 'phone' to 'phone_number' and increased max_length to 20
-       # ✅ UPDATED: Added null=True, blank=True, and max_length=25
     phone_number = models.CharField(
         'Phone Number', 
         max_length=25, 
         unique=True, 
-        null=True,        # <-- ADD THIS (Allows existing users to have no phone number)
-        blank=True,       # <-- ADD THIS (Allows forms to be submitted without it)
+        null=True,        
+        blank=True,       
         validators=[validate_phone_number],
         help_text="Format: +254712345678 or 0712345678"
     )
@@ -68,13 +67,20 @@ class User(AbstractUser):
         'User Role', 
         max_length=20, 
         choices=Role.choices, 
-        default=Role.TENANT
+        default=Role.TENANT # Automatically defaults to tenant!
     )
     
     is_verified = models.BooleanField(
         'Identity Verified', 
         default=False, 
-        help_text="True if user has submitted and passed ID/KRA verification."
+        help_text="True if user has submitted and passed ID/KRA verification. (Tenants do not require this)."
+    )
+    
+    # ✅ NEW: Flag to force password change on first login for manager-created tenants
+    requires_password_change = models.BooleanField(
+        'Requires Password Change',
+        default=False,
+        help_text="If True, the user will be forced to change their temporary password on next login."
     )
     
     is_active = models.BooleanField(
@@ -90,8 +96,9 @@ class User(AbstractUser):
 
     # Tell Django to use email for authentication
     USERNAME_FIELD = 'email'
-    # ✅ UPDATED: Changed 'phone' to 'phone_number' here as well
-    REQUIRED_FIELDS = ['phone_number', 'role']
+    # ✅ FIXED: Removed 'phone_number' because it is optional (null=True). 
+    # Keeping it here would break the `createsuperuser` command.
+    REQUIRED_FIELDS = ['role'] 
 
     class Meta:
         verbose_name = 'User'

@@ -40,27 +40,21 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         phone = validated_data.get('phone_number', '').strip()
         
         # ✅ HANDLE OPTIONAL USERNAME:
-        # If the frontend didn't send a username, but the database model requires one,
-        # we auto-generate a unique username from the email address.
         username = validated_data.pop('username', '').strip()
         if not username and getattr(User, 'USERNAME_FIELD', None) == 'username':
-            username = email.split('@')[0] # e.g., 'fred' from 'fred@gmail.com'
+            username = email.split('@')[0] 
             base_username = username
             counter = 1
-            # Ensure the generated username is unique
             while User.objects.filter(username=username).exists():
                 username = f"{base_username}{counter}"
                 counter += 1
         
-        # Prepare kwargs for create_user
         create_kwargs = validated_data.copy()
         if getattr(User, 'USERNAME_FIELD', None) == 'username':
             create_kwargs['username'] = username
         else:
-            # If the model uses 'email' as the primary field, remove username entirely
             create_kwargs.pop('username', None)
 
-        # Create the user with hashed password
         user = User.objects.create_user(
             email=email,
             password=password,
@@ -199,3 +193,47 @@ class UserStateResponseSerializer(serializers.Serializer):
     role = serializers.CharField()
     next_route = serializers.CharField(help_text="The exact frontend route the user should be redirected to.")
     message = serializers.CharField(help_text="Human-readable message explaining the redirection.")
+
+
+# ==========================================
+# 6. MANAGER-INITIATED TENANT CREATION (NEW)
+# ==========================================
+class TenantIdentitySerializer(serializers.Serializer):
+    """Validates the core login credentials for a new tenant."""
+    email = serializers.EmailField()
+    phone_number = serializers.CharField(max_length=25, required=False, allow_blank=True)
+
+class TenantProfileDataSerializer(serializers.Serializer):
+    """Validates the profile information for the new tenant."""
+    full_name = serializers.CharField(max_length=255)
+    national_id = serializers.CharField(max_length=8, required=False, allow_blank=True)
+    nationality = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    address = serializers.CharField(required=False, allow_blank=True)
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
+
+class TenantNextOfKinDataSerializer(serializers.Serializer):
+    """Validates the emergency contact information for the new tenant."""
+    full_name = serializers.CharField(max_length=255)
+    relationship = serializers.ChoiceField(choices=NextOfKin.RELATIONSHIP_CHOICES)
+    phone_number = serializers.CharField(max_length=15)
+    city = serializers.CharField(max_length=100, required=False, allow_blank=True)
+
+class ManagerCreateTenantSerializer(serializers.Serializer):
+    """
+    Master serializer for the 'Add Tenant' modal.
+    Orchestrates the creation of User, Profile, and NextOfKin via UserService.
+    """
+    tenant_data = TenantIdentitySerializer()
+    profile_data = TenantProfileDataSerializer()
+    next_of_kin_data = TenantNextOfKinDataSerializer(required=False, allow_null=True)
+
+    def create(self, validated_data):
+        manager_user = self.context['request'].user
+        
+        # Permission check: Only managers, landlords, agencies, or admins can do this
+        allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
+        if manager_user.role not in allowed_roles:
+            raise serializers.ValidationError("You do not have permission to create tenant accounts.")
+            
+        # The service handles the actual creation and returns the user + temp password
+        return UserService.create_tenant_for_manager(manager_user, validated_data)

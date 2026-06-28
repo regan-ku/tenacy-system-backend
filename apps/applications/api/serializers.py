@@ -227,6 +227,18 @@ def resolve_applicant(attrs, request):
         except User.DoesNotExist: raise serializers.ValidationError({"applicant": "Invalid tenant ID."})
     return request.user
 
+# ==========================================
+# HELPER TO MAKE QUERYDICT MUTABLE
+# ==========================================
+def _ensure_mutable_dict(data):
+    """Converts immutable QueryDict to a standard mutable Python dict."""
+    if hasattr(data, 'dict'):
+        return data.dict()
+    elif hasattr(data, 'copy'):
+        return data.copy()
+    return data
+
+
 class RentalApplicationCreateSerializer(serializers.Serializer):
     application_type = serializers.CharField(default='rental', required=False)
     applicant = serializers.IntegerField(required=False)
@@ -238,6 +250,7 @@ class RentalApplicationCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def to_internal_value(self, data):
+        data = _ensure_mutable_dict(data)
         data.pop('rental_details', None)
         return super().to_internal_value(data)
 
@@ -283,6 +296,7 @@ class TransferApplicationCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def to_internal_value(self, data):
+        data = _ensure_mutable_dict(data)
         if 'transfer_details' in data and isinstance(data['transfer_details'], dict):
             td = data['transfer_details']
             if 'desired_move_in_date' in td and 'desired_move_in_date' not in data:
@@ -337,6 +351,7 @@ class EvictionApplicationCreateSerializer(serializers.Serializer):
     penalty_amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, default=0)
 
     def to_internal_value(self, data):
+        data = _ensure_mutable_dict(data)
         data.pop('termination_details', None)
         return super().to_internal_value(data)
 
@@ -373,6 +388,7 @@ class ExtensionApplicationCreateSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, default='')
 
     def to_internal_value(self, data):
+        data = _ensure_mutable_dict(data)
         if 'extension_details' in data and isinstance(data['extension_details'], dict):
             ed = data['extension_details']
             if 'new_end_date' in ed and 'new_end_date' not in data:

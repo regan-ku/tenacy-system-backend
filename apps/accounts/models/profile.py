@@ -54,11 +54,7 @@ class Profile(models.Model):
 
     def save(self, *args, **kwargs):
         """
-        ✅ FIXED: Removed the auto-evaluation of profile_complete.
-        The completeness of a profile is now explicitly managed by the UserService 
+        The completeness of a profile is explicitly managed by the UserService 
         based on the specific role's workflow. 
-        This prevents the system from silently resetting profile_complete to False 
-        if a field happens to be an empty string during a standard save().
         """
-        # Simply save the model without guessing if it's complete.
         super().save(*args, **kwargs)

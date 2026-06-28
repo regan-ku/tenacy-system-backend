@@ -13,6 +13,9 @@ router.register(r'next-of-kin', views.NextOfKinViewSet, basename='next-of-kin')
 router.register(r'verification', views.VerificationViewSet, basename='verification')
 router.register(r'auth', views.AuthViewSet, basename='auth')
 
+# ✅ NEW: Register the Manager-Initiated Tenant Creation ViewSet
+router.register(r'manager-tenants', views.ManagerTenantViewSet, basename='manager-tenants')
+
 urlpatterns = [
     # ==========================================
     # 1. STANDARD JWT ENDPOINTS (SimpleJWT)
@@ -25,13 +28,15 @@ urlpatterns = [
     # ==========================================
     # This automatically creates:
     # /auth/login/
+    # /auth/register/
     # /profile/me/
     # /profile/update/
-    # /profile/state/
     # /profile/upgrade/
+    # /profile/complete/
     # /next-of-kin/ (GET/POST)
     # /verification/status/
     # /verification/submit/
+    # /manager-tenants/create/ (POST) ✅ NEW
     path('', include(router.urls)),
     
     # ==========================================

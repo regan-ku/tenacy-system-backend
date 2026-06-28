@@ -1,7 +1,7 @@
 from rest_framework import viewsets, status, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
-from rest_framework.throttling import AnonRateThrottle
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResponse
 
 from django.contrib.auth import get_user_model
@@ -12,6 +12,10 @@ from ..services import AuthService, UserService
 from ..permissions.access_control import IsRole, IsVerifiedUser
 
 User = get_user_model()
+
+# ✅ NEW: Custom throttle for critical initialization endpoints to prevent 429 errors
+class BurstRateThrottle(UserRateThrottle):
+    rate = '1000/minute'
 
 
 @extend_schema_view(
@@ -32,7 +36,6 @@ User = get_user_model()
         request=serializers.RoleUpgradeSerializer,
         responses={200: serializers.UserStateResponseSerializer}
     ),
-    # ✅ ADDED: Schema for the new onboarding completion endpoint
     complete_onboarding=extend_schema(
         summary="Complete Onboarding",
         description="Handles the final onboarding submission including profile, next of kin, and verification documents.",
@@ -42,6 +45,8 @@ User = get_user_model()
 class ProfileViewSet(viewsets.GenericViewSet):
     serializer_class = serializers.ProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
+    # ✅ NEW: Apply the burst throttle to prevent 429 errors on /user-state/ and /me/
+    throttle_classes = [BurstRateThrottle]
 
     def get_queryset(self):
         return Profile.objects.select_related('user').filter(user=self.request.user)
@@ -79,7 +84,6 @@ class ProfileViewSet(viewsets.GenericViewSet):
         serializer.is_valid(raise_exception=True)
         return Response(serializer.save(), status=status.HTTP_200_OK)
 
-    # ✅ ADDED: The missing endpoint that was causing the 404 error!
     @action(detail=False, methods=['POST'], url_path='complete')
     def complete_onboarding(self, request):
         """
@@ -198,3 +202,48 @@ class VerificationViewSet(viewsets.GenericViewSet):
         serializer = self.get_serializer(verification, data=request.data, partial=True, context={'request': request})
         serializer.is_valid(raise_exception=True)
         return Response(self.get_serializer(serializer.save()).data, status=status.HTTP_200_OK)
+
+
+# ==========================================
+# 6. MANAGER-INITIATED TENANT CREATION (NEW)
+# ==========================================
+@extend_schema_view(
+    create_tenant=extend_schema(
+        summary="Manager Create Tenant",
+        description="Allows a manager/landlord/agency to create a new tenant account, profile, and next of kin.",
+        request=serializers.ManagerCreateTenantSerializer,
+        responses={201: OpenApiResponse(description="Tenant created successfully")}
+    )
+)
+class ManagerTenantViewSet(viewsets.GenericViewSet):
+    """
+    ViewSet for managers/landlords/agencies to create tenant accounts.
+    """
+    serializer_class = serializers.ManagerCreateTenantSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    @action(detail=False, methods=['POST'], url_path='create')
+    def create_tenant(self, request):
+        # Manual permission check to ensure only authorized roles can create tenants
+        allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
+        if request.user.role not in allowed_roles:
+            return Response(
+                {"error": "You do not have permission to create tenant accounts."}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+            
+        serializer = self.get_serializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        
+        # The serializer's create method returns a dict with 'user' and 'temp_password'
+        result = serializer.save()
+        
+        # TODO: Trigger SMS/Email notification here with the temp_password
+        # For now, we return it in the response so the frontend can display it or pass it to the notification service
+        
+        return Response({
+            "message": "Tenant account created successfully.",
+            "tenant_id": result['user'].id,
+            "email": result['user'].email,
+            "temp_password": result['temp_password'] 
+        }, status=status.HTTP_201_CREATED)

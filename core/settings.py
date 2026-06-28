@@ -160,8 +160,8 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_THROTTLE_RATES': {
         'anon': '100/hour',
-        'user': '1000/hour',
-        'login': '5/hour', # Prevent brute force on auth endpoints
+        'user': '10000/day',   # ✅ UPDATED: High limit for authenticated users to prevent 429 errors during normal use
+        'login': '20/minute',  # ✅ UPDATED: Changed from 5/hour to 20/minute to prevent lockouts during testing
     }
 }
 
