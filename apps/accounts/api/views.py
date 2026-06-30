@@ -13,7 +13,7 @@ from ..permissions.access_control import IsRole, IsVerifiedUser
 
 User = get_user_model()
 
-# ✅ NEW: Custom throttle for critical initialization endpoints to prevent 429 errors
+# ✅ Custom throttle for critical initialization endpoints to prevent 429 errors
 class BurstRateThrottle(UserRateThrottle):
     rate = '1000/minute'
 
@@ -45,7 +45,6 @@ class BurstRateThrottle(UserRateThrottle):
 class ProfileViewSet(viewsets.GenericViewSet):
     serializer_class = serializers.ProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
-    # ✅ NEW: Apply the burst throttle to prevent 429 errors on /user-state/ and /me/
     throttle_classes = [BurstRateThrottle]
 
     def get_queryset(self):
@@ -86,10 +85,6 @@ class ProfileViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=['POST'], url_path='complete')
     def complete_onboarding(self, request):
-        """
-        Handles the final onboarding submission.
-        Delegates business logic to UserService to keep the view clean.
-        """
         try:
             profile = UserService.complete_onboarding(
                 user=request.user, 
@@ -205,7 +200,7 @@ class VerificationViewSet(viewsets.GenericViewSet):
 
 
 # ==========================================
-# 6. MANAGER-INITIATED TENANT CREATION (NEW)
+# 6. MANAGER-INITIATED TENANT CREATION
 # ==========================================
 @extend_schema_view(
     create_tenant=extend_schema(
@@ -224,7 +219,6 @@ class ManagerTenantViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=['POST'], url_path='create')
     def create_tenant(self, request):
-        # Manual permission check to ensure only authorized roles can create tenants
         allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
         if request.user.role not in allowed_roles:
             return Response(
@@ -234,16 +228,83 @@ class ManagerTenantViewSet(viewsets.GenericViewSet):
             
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
-        
-        # The serializer's create method returns a dict with 'user' and 'temp_password'
         result = serializer.save()
-        
-        # TODO: Trigger SMS/Email notification here with the temp_password
-        # For now, we return it in the response so the frontend can display it or pass it to the notification service
         
         return Response({
             "message": "Tenant account created successfully.",
             "tenant_id": result['user'].id,
             "email": result['user'].email,
             "temp_password": result['temp_password'] 
+        }, status=status.HTTP_201_CREATED)
+
+
+# ==========================================
+# 7. APPLICANT RESOLUTION & STAFF CREATION (NEW)
+# ==========================================
+@extend_schema_view(
+    lookup_applicant=extend_schema(
+        summary="Lookup Applicant",
+        description="Smart lookup to check if an applicant exists and what data is missing.",
+        request=serializers.LookupApplicantSerializer,
+        responses={200: OpenApiResponse(description="Lookup result")}
+    ),
+    create_staff=extend_schema(
+        summary="Create Staff Member",
+        description="Allows a manager to create a staff member (Agent/Caretaker) with a ghost profile.",
+        request=serializers.StaffCreateSerializer,
+        responses={201: OpenApiResponse(description="Staff created successfully")}
+    )
+)
+class ApplicantManagementViewSet(viewsets.GenericViewSet):
+    """
+    ViewSet for resolving applicants (Smart Lookup) and creating staff members.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @action(detail=False, methods=['POST'], url_path='lookup')
+    def lookup_applicant(self, request):
+        serializer = serializers.LookupApplicantSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        result = UserService.lookup_applicant(
+            email=serializer.validated_data.get('email'),
+            phone=serializer.validated_data.get('phone_number')
+        )
+        
+        user_data = None
+        if result['user']:
+            profile = getattr(result['user'], 'profile', None)
+            user_data = {
+                "id": result['user'].id,
+                "email": result['user'].email,
+                "phone_number": result['user'].phone_number,
+                "full_name": profile.full_name if profile else None
+            }
+            
+        return Response({
+            "status": result['status'],
+            "role": result['role'],
+            "missing_fields": result['missing_fields'],
+            "user": user_data
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['POST'], url_path='create-staff')
+    def create_staff(self, request):
+        allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
+        if request.user.role not in allowed_roles:
+            return Response(
+                {"error": "You do not have permission to create staff accounts."}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+            
+        serializer = serializers.StaffCreateSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        result = serializer.save()
+        
+        return Response({
+            "message": "Staff account created successfully.",
+            "staff_id": result['user'].id,
+            "email": result['user'].email,
+            "role": result['user'].role,
+            "temp_password": result['temp_password']
         }, status=status.HTTP_201_CREATED)

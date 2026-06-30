@@ -196,15 +196,39 @@ class UserStateResponseSerializer(serializers.Serializer):
 
 
 # ==========================================
-# 6. MANAGER-INITIATED TENANT CREATION (NEW)
+# 6. SMART LOOKUP, STAFF & TENANT CREATION
 # ==========================================
+class LookupApplicantSerializer(serializers.Serializer):
+    """Validates input for the Smart Lookup API."""
+    email = serializers.EmailField(required=False, allow_blank=True)
+    phone_number = serializers.CharField(max_length=25, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if not attrs.get('email') and not attrs.get('phone_number'):
+            raise serializers.ValidationError("Either email or phone number is required.")
+        return attrs
+
+class StaffCreateSerializer(serializers.Serializer):
+    """Validates input for creating a Staff member (Ghost Profile)."""
+    full_name = serializers.CharField(max_length=255)
+    email = serializers.EmailField()
+    phone_number = serializers.CharField(max_length=25, required=False, allow_blank=True)
+    role = serializers.ChoiceField(choices=[User.Role.AGENT, User.Role.CARETAKER])
+
+    def create(self, validated_data):
+        manager_user = self.context['request'].user
+        allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
+        if manager_user.role not in allowed_roles:
+            raise serializers.ValidationError("You do not have permission to create staff accounts.")
+        return UserService.create_staff_for_manager(manager_user, validated_data)
+
 class TenantIdentitySerializer(serializers.Serializer):
-    """Validates the core login credentials for a new tenant."""
+    """Validates the core login credentials for a new/existing tenant."""
     email = serializers.EmailField()
     phone_number = serializers.CharField(max_length=25, required=False, allow_blank=True)
 
 class TenantProfileDataSerializer(serializers.Serializer):
-    """Validates the profile information for the new tenant."""
+    """Validates the profile information for the new/existing tenant."""
     full_name = serializers.CharField(max_length=255)
     national_id = serializers.CharField(max_length=8, required=False, allow_blank=True)
     nationality = serializers.CharField(max_length=100, required=False, allow_blank=True)
@@ -212,7 +236,7 @@ class TenantProfileDataSerializer(serializers.Serializer):
     date_of_birth = serializers.DateField(required=False, allow_null=True)
 
 class TenantNextOfKinDataSerializer(serializers.Serializer):
-    """Validates the emergency contact information for the new tenant."""
+    """Validates the emergency contact information for the new/existing tenant."""
     full_name = serializers.CharField(max_length=255)
     relationship = serializers.ChoiceField(choices=NextOfKin.RELATIONSHIP_CHOICES)
     phone_number = serializers.CharField(max_length=15)
@@ -221,7 +245,7 @@ class TenantNextOfKinDataSerializer(serializers.Serializer):
 class ManagerCreateTenantSerializer(serializers.Serializer):
     """
     Master serializer for the 'Add Tenant' modal.
-    Orchestrates the creation of User, Profile, and NextOfKin via UserService.
+    Orchestrates the creation OR UPDATE of User, Profile, and NextOfKin via UserService.
     """
     tenant_data = TenantIdentitySerializer()
     profile_data = TenantProfileDataSerializer()
@@ -233,7 +257,7 @@ class ManagerCreateTenantSerializer(serializers.Serializer):
         # Permission check: Only managers, landlords, agencies, or admins can do this
         allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
         if manager_user.role not in allowed_roles:
-            raise serializers.ValidationError("You do not have permission to create tenant accounts.")
+            raise serializers.ValidationError("You do not have permission to manage tenant accounts.")
             
-        # The service handles the actual creation and returns the user + temp password
-        return UserService.create_tenant_for_manager(manager_user, validated_data)
+        # The service handles the actual creation/update and returns the user + temp password
+        return UserService.create_or_update_tenant_for_manager(manager_user, validated_data)

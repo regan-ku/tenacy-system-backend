@@ -12,66 +12,186 @@ class UserService:
     """
 
     @staticmethod
-    @transaction.atomic
-    def create_tenant_for_manager(manager_user: User, payload: dict) -> dict:
+    def lookup_applicant(email=None, phone=None):
         """
-        Creates a new Tenant user, Profile, and NextOfKin on behalf of a manager.
-        Generates a temporary password and flags the user to change it on first login.
-        Returns a dict with the 'user' and the plain-text 'temp_password' for notifications.
+        SMART LOOKUP ENGINE: Finds a user by email or phone and determines their 
+        readiness to be added as a tenant. Powers the dynamic 'Add Tenant' Modal.
+        """
+        user = None
+        if email:
+            user = User.objects.filter(email__iexact=email.strip()).first()
+        elif phone:
+            user = User.objects.filter(phone_number=phone).first()
+            
+        if not user:
+            return {
+                "status": "new_user",
+                "user": None,
+                "role": None,
+                "missing_fields": []
+            }
+            
+        # Check if Agency (handled differently in frontend)
+        if user.role == User.Role.AGENCY:
+            return {
+                "status": "existing_agency",
+                "user": user,
+                "role": user.role,
+                "missing_fields": [] 
+            }
+            
+        profile = getattr(user, 'profile', None)
+        
+        # ✅ CRITICAL FIX: For tenancy purposes, a profile is only "complete" if it has 
+        # the legal requirements (DOB + Next of Kin) plus basic fields.
+        # This prevents Staff members with "Ghost Profiles" from bypassing the interceptor.
+        has_dob = bool(profile and profile.date_of_birth)
+        has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
+        has_nationality = bool(profile and profile.nationality)
+        has_address = bool(profile and profile.address)
+        
+        is_legally_complete = has_dob and has_nok and has_nationality and has_address
+        
+        if not is_legally_complete:
+            missing_fields = []
+            if not has_nationality: missing_fields.append('nationality')
+            if not has_address: missing_fields.append('address')
+            if not has_dob: missing_fields.append('date_of_birth')
+            if not has_nok: missing_fields.append('next_of_kin')
+                
+            return {
+                "status": "existing_incomplete",
+                "user": user,
+                "role": user.role,
+                "missing_fields": missing_fields
+            }
+            
+        return {
+            "status": "existing_complete",
+            "user": user,
+            "role": user.role,
+            "missing_fields": []
+        }
+
+    @staticmethod
+    @transaction.atomic
+    def create_or_update_tenant_for_manager(manager_user: User, payload: dict) -> dict:
+        """
+        UNIVERSAL TENANT CREATOR: Handles both creating a brand new tenant AND 
+        updating an existing incomplete tenant (like a staff member) to complete 
+        their legal profile. Prevents duplicate accounts.
         """
         tenant_data = payload.get('tenant_data', {})
         profile_data = payload.get('profile_data', {})
         nok_data = payload.get('next_of_kin_data', {})
 
-        email = tenant_data.get('email')
+        email = tenant_data.get('email', '').strip().lower()
         phone = tenant_data.get('phone_number') or tenant_data.get('phone')
 
         if not email:
-            raise ValidationError("Email is required to create a tenant account.")
+            raise ValidationError("Email is required.")
 
-        # Prevent duplicate accounts
+        # 1. Check if user already exists
+        existing_user = User.objects.filter(email=email).first()
+        if not existing_user and phone:
+            existing_user = User.objects.filter(phone_number=phone).first()
+
+        temp_password = None
+
+        if existing_user:
+            user = existing_user
+            
+            # Update Profile (Merge new data with existing Ghost Profile)
+            profile, _ = Profile.objects.get_or_create(user=user)
+            if profile_data.get('full_name'): profile.full_name = profile_data['full_name']
+            if profile_data.get('national_id'): profile.national_id = profile_data['national_id']
+            if profile_data.get('nationality'): profile.nationality = profile_data['nationality']
+            if profile_data.get('address'): profile.address = profile_data['address']
+            if profile_data.get('date_of_birth'): profile.date_of_birth = profile_data['date_of_birth']
+            
+            # Force complete (Bypasses model save quirks)
+            Profile.objects.filter(pk=profile.pk).update(profile_complete=True)
+            
+        else:
+            # Create New User
+            temp_password = f"Temp{secrets.token_urlsafe(8)}!"
+            user = User.objects.create_user(
+                email=email,
+                password=temp_password,
+                phone_number=phone,
+                role=User.Role.TENANT,
+                is_verified=False,
+                requires_password_change=True
+            )
+            
+            Profile.objects.create(
+                user=user,
+                full_name=profile_data.get('full_name', ''),
+                national_id=profile_data.get('national_id') or profile_data.get('id_number'),
+                nationality=profile_data.get('nationality', ''),
+                address=profile_data.get('address', ''),
+                date_of_birth=profile_data.get('date_of_birth'),
+                profile_complete=True
+            )
+
+        # 2. Handle Next of Kin (Create or Update Primary)
+        if nok_data.get('full_name'):
+            NextOfKin.objects.update_or_create(
+                user=user, is_primary=True,
+                defaults={
+                    'full_name': nok_data['full_name'],
+                    'relationship': nok_data.get('relationship', 'other'),
+                    'phone_number': nok_data.get('phone_number') or nok_data.get('phone', ''),
+                    'city': nok_data.get('city', ''),
+                }
+            )
+
+        return {
+            "user": user,
+            "temp_password": temp_password,
+            "is_new": temp_password is not None
+        }
+
+    @staticmethod
+    @transaction.atomic
+    def create_staff_for_manager(manager_user: User, payload: dict) -> dict:
+        """
+        Creates a Staff member (Agent/Caretaker) with a Ghost Profile.
+        They can log in immediately, but profile_complete=False triggers 
+        the Tenant Profile Interceptor if they try to rent a unit.
+        """
+        email = payload.get('email', '').strip().lower()
+        phone = payload.get('phone_number')
+        full_name = payload.get('full_name')
+        role = payload.get('role', User.Role.AGENT)
+
+        if not email:
+            raise ValidationError("Email is required.")
         if User.objects.filter(email=email).exists():
             raise ValidationError(f"A user with the email {email} already exists.")
         if phone and User.objects.filter(phone_number=phone).exists():
             raise ValidationError(f"A user with the phone number {phone} already exists.")
 
-        # Generate a secure temporary password
         temp_password = f"Temp{secrets.token_urlsafe(8)}!"
 
-        # 1. Create the User Account
-        new_tenant = User.objects.create_user(
+        user = User.objects.create_user(
             email=email,
             password=temp_password,
             phone_number=phone,
-            role=User.Role.TENANT,
-            is_verified=False, # Tenants do not require identity verification
-            requires_password_change=True # Force password change on first login
+            role=role,
+            is_verified=False,
+            requires_password_change=True
         )
 
-        # 2. Create the Profile
+        # Create Ghost Profile (Incomplete)
         Profile.objects.create(
-            user=new_tenant,
-            full_name=profile_data.get('full_name', ''),
-            national_id=profile_data.get('national_id') or profile_data.get('id_number'),
-            nationality=profile_data.get('nationality', ''),
-            address=profile_data.get('address', ''),
-            date_of_birth=profile_data.get('date_of_birth'),
-            profile_complete=True # Manager completed it on their behalf
+            user=user,
+            full_name=full_name,
+            profile_complete=False 
         )
-
-        # 3. Create Next of Kin (if provided)
-        if nok_data.get('full_name'):
-            NextOfKin.objects.create(
-                user=new_tenant,
-                full_name=nok_data.get('full_name'),
-                relationship=nok_data.get('relationship', 'other'),
-                phone_number=nok_data.get('phone_number') or nok_data.get('phone', ''),
-                city=nok_data.get('city', ''),
-                is_primary=True
-            )
 
         return {
-            "user": new_tenant,
+            "user": user,
             "temp_password": temp_password
         }
 
@@ -101,18 +221,41 @@ class UserService:
                     "next_route": "/onboarding",
                     "message": "Please complete your profile to proceed with your tenancy."
                 }
+            
+            # ✅ CRITICAL FIX FOR STAFF (AGENT/CARETAKER)
             elif user.role in [User.Role.AGENT, User.Role.CARETAKER]:
-                if profile:
+                # Check if they have the minimum operational profile (Name, Phone)
+                has_basic_profile = profile and profile.full_name and user.phone_number
+                
+                if not has_basic_profile:
+                    return {
+                        "profile_complete": False,
+                        "role": user.role,
+                        "next_route": "/onboarding",
+                        "message": "Please complete your basic profile to access your dashboard."
+                    }
+                
+                # They have basic profile, they can access their operational dashboard.
+                # Mark operational profile as complete so they aren't blocked from working.
+                if profile and not profile.profile_complete:
                     profile.profile_complete = True
                     profile.save(update_fields=['profile_complete'])
-                else:
-                    Profile.objects.create(user=user, profile_complete=True)
+                elif not profile:
+                    Profile.objects.create(user=user, full_name=user.email.split('@')[0], profile_complete=True)
+                
+                # Check if they are legally ready to be a tenant (DOB + Next of Kin)
+                has_dob = bool(profile and profile.date_of_birth)
+                has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
+                is_tenant_ready = has_dob and has_nok
+                
                 return {
-                    "profile_complete": True,
+                    "profile_complete": True, # Operational profile is complete
+                    "tenant_profile_complete": is_tenant_ready, # Legal tenant profile status
                     "role": user.role,
                     "next_route": f"/dashboard/{user.role}",
                     "message": "Welcome to your operational dashboard."
                 }
+                
             else:
                 return {
                     "profile_complete": False,
@@ -121,6 +264,14 @@ class UserService:
                     "message": "Please complete your profile to continue."
                 }
 
+        # ✅ If profile is complete, we still need to calculate tenant_profile_complete 
+        # for Agents/Caretakers so the ApplicationWizardGuard knows if they can rent.
+        tenant_profile_complete = True
+        if user.role in [User.Role.AGENT, User.Role.CARETAKER]:
+            has_dob = bool(profile and profile.date_of_birth)
+            has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
+            tenant_profile_complete = has_dob and has_nok
+
         # 2. TENANT LOGIC (Record-based & State-Driven)
         if is_acting_as_tenant:
             # A. Check for active tenancy (Highest priority)
@@ -128,6 +279,7 @@ class UserService:
             if has_active_tenancy:
                 return {
                     "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
                     "next_route": "/dashboard/tenant",
                     "message": "Welcome back to your tenant dashboard."
@@ -142,6 +294,7 @@ class UserService:
             if has_approved_application:
                 return {
                     "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
                     "next_route": "/dashboard/tenant",
                     "message": "You have an approved application. Proceed to your dashboard to finalize your tenancy."
@@ -156,6 +309,7 @@ class UserService:
             if has_pending_application:
                 return {
                     "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
                     "next_route": "/applications/pending",
                     "message": "Your application is currently under review by the property manager."
@@ -166,6 +320,7 @@ class UserService:
             if incomplete_app:
                 return {
                     "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
                     "next_route": "/marketplace", 
                     "message": "Resume your incomplete rental application."
@@ -174,6 +329,7 @@ class UserService:
             # E. No active tenancy, no approved/pending applications -> Marketplace
             return {
                 "profile_complete": True,
+                "tenant_profile_complete": tenant_profile_complete,
                 "role": user.role,
                 "next_route": "/marketplace",
                 "message": "You have no active tenancies. Browse available properties."
@@ -211,9 +367,21 @@ class UserService:
                     if verification and verification.status == 'verified':
                         is_verified = True
 
+            # ✅ CRITICAL FIX: Calculate tenant_profile_complete for Landlords.
+            # Since Landlords must complete their profile (including DOB/NOK) to add properties,
+            # if they are applying as a tenant, the system will correctly find their details.
+            # Agencies remain False for individual tenancy.
+            if user.role == User.Role.LANDLORD:
+                has_dob = bool(profile and profile.date_of_birth)
+                has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
+                tenant_profile_complete = has_dob and has_nok
+            else:
+                tenant_profile_complete = False # Agencies don't rent as individuals
+
             if not is_verified:
                 return {
                     "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete, # ✅ UPDATED
                     "role": user.role,
                     "next_route": "/pending-verification",
                     "message": "Your identity and compliance documents are currently under review."
@@ -239,6 +407,7 @@ class UserService:
                         if pending_delegations:
                             return {
                                 "profile_complete": True,
+                                "tenant_profile_complete": tenant_profile_complete, # ✅ UPDATED
                                 "role": user.role,
                                 "next_route": "/dashboard/agency",
                                 "message": "Welcome! You have pending property delegations."
@@ -256,6 +425,7 @@ class UserService:
             if has_completed:
                 return {
                     "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete, # ✅ UPDATED
                     "role": user.role,
                     "next_route": f"/dashboard/{user.role}",
                     "message": "Welcome back to your management dashboard."
@@ -265,6 +435,7 @@ class UserService:
                 draft_property = user_properties.first()
                 return {
                     "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete, # ✅ UPDATED
                     "role": user.role,
                     "next_route": f"/properties/wizard?property_id={draft_property.id}",
                     "message": "Resume your incomplete property setup."
@@ -272,14 +443,16 @@ class UserService:
                 
             return {
                 "profile_complete": True,
+                "tenant_profile_complete": tenant_profile_complete, # ✅ UPDATED
                 "role": user.role,
                 "next_route": "/properties/wizard",
                 "message": "Your account is verified! Get started by creating your first property."
             }
 
-        # 4. AGENT & CARETAKER LOGIC
+        # 4. AGENT & CARETAKER LOGIC (Fallback if they somehow bypassed the profile check)
         return {
             "profile_complete": True,
+            "tenant_profile_complete": tenant_profile_complete,
             "role": user.role,
             "next_route": f"/dashboard/{user.role}",
             "message": "Welcome to your operational dashboard."
