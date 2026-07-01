@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResponse
+from django.utils import timezone
 
 from django.contrib.auth import get_user_model
 
@@ -10,6 +11,9 @@ from . import serializers
 from ..models import Profile, NextOfKin, Verification
 from ..services import AuthService, UserService
 from ..permissions.access_control import IsRole, IsVerifiedUser
+
+# ✅ IMPORT: Required to auto-terminate property assignments & fetch them
+from apps.properties.models.staff_assignment import PropertyStaffAssignment
 
 User = get_user_model()
 
@@ -211,9 +215,6 @@ class VerificationViewSet(viewsets.GenericViewSet):
     )
 )
 class ManagerTenantViewSet(viewsets.GenericViewSet):
-    """
-    ViewSet for managers/landlords/agencies to create tenant accounts.
-    """
     serializer_class = serializers.ManagerCreateTenantSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -239,7 +240,7 @@ class ManagerTenantViewSet(viewsets.GenericViewSet):
 
 
 # ==========================================
-# 7. APPLICANT RESOLUTION & STAFF CREATION (NEW)
+# 7. APPLICANT RESOLUTION & STAFF MANAGEMENT (UPDATED)
 # ==========================================
 @extend_schema_view(
     lookup_applicant=extend_schema(
@@ -250,14 +251,30 @@ class ManagerTenantViewSet(viewsets.GenericViewSet):
     ),
     create_staff=extend_schema(
         summary="Create Staff Member",
-        description="Allows a manager to create a staff member (Agent/Caretaker) with a ghost profile.",
+        description="Allows a manager to create a staff member (Agent/Caretaker/Property Manager) with a ghost profile.",
         request=serializers.StaffCreateSerializer,
         responses={201: OpenApiResponse(description="Staff created successfully")}
+    ),
+    list_staff=extend_schema(
+        summary="List Staff Members",
+        description="Fetches all agents, caretakers, and property managers managed by the logged-in user.",
+        responses={200: OpenApiResponse(description="List of staff members")}
+    ),
+    deactivate_staff=extend_schema(
+        summary="Deactivate Staff Member",
+        description="Revokes a staff member's access to the system, logs the reason, and auto-terminates property assignments.",
+        responses={200: OpenApiResponse(description="Staff deactivated successfully")}
+    ),
+    # ✅ NEW: Schema for Get Staff Assignments
+    get_staff_assignments=extend_schema(
+        summary="Get Staff Property Assignments",
+        description="Fetches all active property assignments for a specific staff member.",
+        responses={200: OpenApiResponse(description="List of property assignments")}
     )
 )
 class ApplicantManagementViewSet(viewsets.GenericViewSet):
     """
-    ViewSet for resolving applicants (Smart Lookup) and creating staff members.
+    ViewSet for resolving applicants (Smart Lookup), creating staff members, listing staff, and deactivating staff.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -308,3 +325,99 @@ class ApplicantManagementViewSet(viewsets.GenericViewSet):
             "role": result['user'].role,
             "temp_password": result['temp_password']
         }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['GET'], url_path='list-staff')
+    def list_staff(self, request):
+        if request.user.role not in [User.Role.LANDLORD, User.Role.AGENCY, User.Role.ADMIN]:
+            return Response(
+                {"error": "You do not have permission to view staff accounts."}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+            
+        allowed_roles = [User.Role.AGENT, User.Role.CARETAKER]
+        if hasattr(User.Role, 'PROPERTY_MANAGER'):
+            allowed_roles.append(User.Role.PROPERTY_MANAGER)
+            
+        queryset = User.objects.filter(
+            role__in=allowed_roles
+        ).select_related('profile').order_by('-date_joined')
+
+        staff_data = []
+        for u in queryset:
+            staff_data.append({
+                "id": u.id,
+                "full_name": u.profile.full_name if u.profile else u.email.split('@')[0],
+                "email": u.email,
+                "phone_number": u.phone_number,
+                "role": u.role,
+                "is_active": u.is_active,
+                "date_joined": u.date_joined.strftime('%Y-%m-%d') if u.date_joined else None,
+            })
+            
+        return Response(staff_data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['PATCH'], url_path='deactivate')
+    def deactivate_staff(self, request, pk=None):
+        """
+        Deactivates a staff member's account, logs the reason, 
+        and AUTOMATICALLY terminates all their property assignments.
+        """
+        if request.user.role not in [User.Role.LANDLORD, User.Role.AGENCY, User.Role.ADMIN]:
+            return Response(
+                {"error": "You do not have permission to deactivate staff accounts."}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+            
+        try:
+            staff_user = User.objects.get(id=pk)
+        except User.DoesNotExist:
+            return Response({"error": "Staff member not found."}, status=status.HTTP_404_NOT_FOUND)
+            
+        reason = request.data.get('reason', 'No reason provided.')
+        
+        # 1. Deactivate the user account
+        staff_user.is_active = False
+        staff_user.save(update_fields=['is_active'])
+        
+        # ✅ 2. CRITICAL FIX: Auto-terminate all active property assignments
+        terminated_count = PropertyStaffAssignment.objects.filter(
+            user=staff_user,
+            is_active=True
+        ).update(
+            is_active=False, 
+            terminated_at=timezone.now(),
+            notes=f"Auto-terminated due to staff revocation: {reason}"
+        )
+        
+        return Response({
+            "message": f"Staff member {staff_user.email} has been successfully deactivated.",
+            "reason": reason,
+            "assignments_terminated": terminated_count
+        }, status=status.HTTP_200_OK)
+
+    # ✅ NEW: GET STAFF PROPERTY ASSIGNMENTS
+    @action(detail=True, methods=['GET'], url_path='assignments')
+    def get_staff_assignments(self, request, pk=None):
+        """Fetches all active property assignments for a specific staff member."""
+        if request.user.role not in [User.Role.LANDLORD, User.Role.AGENCY, User.Role.ADMIN]:
+            return Response(
+                {"error": "You do not have permission to view staff assignments."}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+            
+        assignments = PropertyStaffAssignment.objects.filter(
+            user_id=pk, 
+            is_active=True
+        ).select_related('property', 'assigned_by_agency').order_by('-assigned_at')
+        
+        data = []
+        for assignment in assignments:
+            data.append({
+                "assignment_id": assignment.id,
+                "property_id": assignment.property.id,
+                "property_name": assignment.property.title,
+                "operational_role": assignment.operational_role,
+                "assigned_by_agency": assignment.assigned_by_agency.name if assignment.assigned_by_agency else "Direct Landlord",
+                "assigned_at": assignment.assigned_at.strftime('%Y-%m-%d') if assignment.assigned_at else None
+            })
+        return Response(data, status=status.HTTP_200_OK)

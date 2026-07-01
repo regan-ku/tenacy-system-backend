@@ -3,35 +3,34 @@ from django.conf import settings
 
 class AgencyStaff(models.Model):
     """
-    Represents internal staff members (Agents, Caretakers, Admins) 
-    employed by or contracted to an Agency.
+    Represents staff members (Agents, Caretakers, Property Managers).
+    Can be employed by an Agency OR assigned directly by a Landlord (for Caretakers).
     """
     class StaffRole(models.TextChoices):
-        PROPERTY_MANAGER = 'property_manager', 'Property Manager'
-        FIELD_AGENT = 'field_agent', 'Field Agent'
-        MAINTENANCE_SUPERVISOR = 'maintenance_supervisor', 'Maintenance Supervisor'
-        OPERATIONS_ADMIN = 'operations_admin', 'Operations Admin'
-        CARETAKER = 'caretaker', 'Caretaker'
+        PROPERTY_MANAGER = 'property_manager', 'Property Manager' # Agency Only
+        AGENT = 'agent', 'Agent' # Agency Only
+        CARETAKER = 'caretaker', 'Caretaker' # Landlord & Agency
 
     class Status(models.TextChoices):
         ACTIVE = 'active', 'Active'
         SUSPENDED = 'suspended', 'Suspended'
         TERMINATED = 'terminated', 'Terminated'
 
+    # ✅ UPDATED: Null allowed if created directly by a Landlord
     agency = models.ForeignKey(
         'Agency',
         on_delete=models.CASCADE,
         related_name='staff_members',
-        help_text="The agency this staff member belongs to."
-    )
-    
-    # Links to the actual User account. If null, they are a pending invite.
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='agency_staff_profiles',
+        help_text="The agency this staff member belongs to. Null if assigned directly by a landlord."
+    )
+    
+    # ✅ UPDATED: User is now strictly required. Staff cannot exist without an account.
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='staff_profiles',
         help_text="Linked system user account."
     )
     
@@ -57,23 +56,19 @@ class AgencyStaff(models.Model):
     notes = models.TextField('Internal Notes', blank=True, null=True)
 
     class Meta:
-        verbose_name = 'Agency Staff Member'
-        verbose_name_plural = 'Agency Staff Members'
-        constraints = [
-            models.UniqueConstraint(
-                fields=['agency', 'user'],
-                condition=models.Q(user__isnull=False),
-                name='unique_staff_user_per_agency'
-            )
-        ]
+        verbose_name = 'Staff Member'
+        verbose_name_plural = 'Staff Members'
+        # ✅ UPDATED: Removed the complex unique constraint that breaks when agency is null.
         indexes = [
             models.Index(fields=['agency', 'status']),
             models.Index(fields=['user', 'status']),
+            models.Index(fields=['role', 'status']), # ✅ Added for fast role filtering
         ]
 
     def __str__(self):
         user_email = self.user.email if self.user else (self.contact_email or "Pending Invite")
-        return f"{user_email} ({self.get_role_display()}) - {self.agency.name}"
+        agency_name = self.agency.name if self.agency else "Direct Landlord Assignment"
+        return f"{user_email} ({self.get_role_display()}) - {agency_name}"
 
     def save(self, *args, **kwargs):
         if self.contact_email:

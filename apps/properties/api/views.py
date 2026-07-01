@@ -5,13 +5,14 @@ from rest_framework.permissions import BasePermission
 from django.core.exceptions import ValidationError
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResponse, OpenApiParameter, OpenApiTypes
 
-from django.db.models import Q, Prefetch, Exists, OuterRef 
+from django.db.models import Q, Prefetch, Exists, OuterRef, Count
 from django.contrib.auth import get_user_model
 
 from . import serializers as prop_serializers
 from ..models import Property, UnitGroup, Unit, PropertyMedia
+from ..models.staff_assignment import PropertyStaffAssignment
 from ..models.enums import UnitStatus
-from ..services import UnitGroupService, UnitService
+from ..services import UnitGroupService, UnitService, PropertyService
 from ..permissions.property_permissions import IsPropertyOwnerOrManager, IsDelegatedAgencyStaff, IsMarketplaceReadOnly
 from apps.tenancy.models.tenancy import Tenancy
 from apps.accounts.models.next_of_kin import NextOfKin
@@ -21,7 +22,6 @@ from apps.agencies.models.delegated_property import DelegatedProperty
 
 User = get_user_model()
 
-# ✅ Combined Permission Class (OR Logic)
 class IsOwnerOrDelegated(BasePermission):
     """
     Allows access if the user is the property owner/manager OR a delegated agency staff.
@@ -30,23 +30,18 @@ class IsOwnerOrDelegated(BasePermission):
         return request.user and request.user.is_authenticated
 
     def has_object_permission(self, request, view, obj):
-        # Handle both Unit (property_ref) and UnitGroup/Property (property)
         property_obj = getattr(obj, 'property_ref', None) or getattr(obj, 'property', None)
-        
-        # If the object itself is the Property (from PropertyViewSet)
         if obj.__class__.__name__ == 'Property':
             property_obj = obj
             
         if not property_obj:
             return False
         
-        # 1. Check if user is the owner or current manager
         if property_obj.created_by == request.user:
             return True
         if getattr(property_obj, 'current_manager', None) == request.user:
             return True
             
-        # 2. Check if user is a delegated agency staff
         try:
             return IsDelegatedAgencyStaff().has_object_permission(request, view, property_obj)
         except Exception:
@@ -64,8 +59,6 @@ class UnitStatusUpdateSerializer(serializers.Serializer):
 )
 class PropertyViewSet(viewsets.ModelViewSet):
     serializer_class = prop_serializers.PropertySerializer
-    
-    # ✅ SECURITY FIX: Added IsOwnerOrDelegated to prevent unauthorized edits via direct API calls
     permission_classes = [permissions.IsAuthenticated, IsOwnerOrDelegated]
     parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
 
@@ -76,13 +69,62 @@ class PropertyViewSet(viewsets.ModelViewSet):
             return Property.objects.none()
             
         user = self.request.user
+        
         if user.role == 'admin':
-            qs = Property.objects.all().select_related('location', 'created_by', 'created_by__profile')
+            qs = Property.objects.all()
         else:
-            qs = Property.objects.filter(
-                Q(created_by=user) | Q(current_manager=user)
-            ).select_related('location', 'created_by', 'created_by__profile').distinct()
+            q_filters = Q(created_by=user) | Q(current_manager=user)
+            
+            if user.role == 'agency':
+                agency = Agency.objects.filter(
+                    Q(created_by=user) | 
+                    Q(directors__user=user) | 
+                    Q(staff_members__user=user, staff_members__status='active')
+                ).first()
+                
+                if agency:
+                    q_filters |= Q(
+                        agency_delegations__agency=agency,
+                        agency_delegations__status='active'
+                    )
+            
+            if user.role in ['agent', 'caretaker', 'property_manager']:
+                q_filters |= Q(
+                    staff_assignments__user=user,
+                    staff_assignments__is_active=True
+                )
+                
+            qs = Property.objects.filter(q_filters)
+            
+        qs = qs.select_related('location', 'created_by', 'created_by__profile')
 
+        # ==========================================
+        # 🚀 PERFORMANCE FIX: ANNOTATE COUNTS TO PREVENT N+1 QUERIES
+        # ==========================================
+        qs = qs.annotate(
+            total_units_count=Count('units', distinct=True),
+            occupied_units_count=Count(
+                'units',
+                filter=Q(units__tenancies__status__in=['active', 'extended', 'pending_payment']),
+                distinct=True
+            )
+        )
+        # ==========================================
+
+        # Filter out properties that already have an active staff member of the requested role
+        available_for_role = self.request.query_params.get('available_for_role')
+        if available_for_role:
+            excluded_ids = list(
+                PropertyStaffAssignment.objects.filter(
+                    operational_role=available_for_role,
+                    is_active=True
+                ).values_list('property_id', flat=True)
+            )
+            
+            if excluded_ids:
+                qs = qs.exclude(id__in=excluded_ids)
+
+        # Prefetch delegation info for serializer (if agency)
         if user.role == 'agency':
             agency = Agency.objects.filter(
                 Q(created_by=user) | 
@@ -98,10 +140,81 @@ class PropertyViewSet(viewsets.ModelViewSet):
                         to_attr='active_agency_delegation'
                     )
                 )
+                
         return qs
 
     def perform_create(self, serializer):
         serializer.save()
+
+    # ==========================================
+    # ✅ STAFF ASSIGNMENT ENDPOINTS
+    # ==========================================
+
+    @extend_schema(
+        summary="Get Property Staff", 
+        responses={200: prop_serializers.PropertyStaffAssignmentSerializer(many=True)}
+    )
+    @action(detail=True, methods=['GET'], url_path='staff', permission_classes=[IsOwnerOrDelegated])
+    def get_staff(self, request, pk=None):
+        property_obj = self.get_object()
+        staff = PropertyService.get_property_staff(property_obj)
+        serializer = prop_serializers.PropertyStaffAssignmentSerializer(staff, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Assign Staff to Property", 
+        request=prop_serializers.AssignStaffRequestSerializer,
+        responses={201: prop_serializers.PropertyStaffAssignmentSerializer}
+    )
+    @action(detail=True, methods=['POST'], url_path='staff/assign', permission_classes=[IsPropertyOwnerOrManager])
+    def assign_staff(self, request, pk=None):
+        property_obj = self.get_object()
+        serializer = prop_serializers.AssignStaffRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        user_id = serializer.validated_data['user_id']
+        operational_role = serializer.validated_data['operational_role']
+        notes = serializer.validated_data.get('notes')
+        
+        try:
+            user_to_assign = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"error": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            
+        try:
+            assignment = PropertyService.assign_staff_to_property(
+                property_obj=property_obj,
+                user_to_assign=user_to_assign,
+                assigning_user=request.user,
+                operational_role=operational_role,
+                notes=notes
+            )
+            out_serializer = prop_serializers.PropertyStaffAssignmentSerializer(assignment)
+            return Response(out_serializer.data, status=status.HTTP_201_CREATED)
+        except ValidationError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        summary="Terminate Staff Assignment",
+        responses={200: OpenApiResponse(description="Assignment terminated")}
+    )
+    @action(detail=True, methods=['POST'], url_path='staff/(?P<user_id>[^/.]+)/terminate', permission_classes=[IsPropertyOwnerOrManager])
+    def terminate_staff(self, request, pk=None, user_id=None):
+        property_obj = self.get_object()
+        try:
+            user_to_remove = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"error": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            
+        try:
+            PropertyService.terminate_staff_assignment(
+                property_obj=property_obj,
+                user_to_remove=user_to_remove,
+                assigning_user=request.user
+            )
+            return Response({"message": "Staff assignment terminated successfully."}, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @extend_schema(summary="Generate Units from Group")
     @action(detail=True, methods=['POST'], url_path='unit-groups/(?P<group_pk>[^/.]+)/generate', permission_classes=[IsPropertyOwnerOrManager])
@@ -124,7 +237,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if not groups_data:
             return Response({"error": "No unit groups provided."}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            created_groups = UnitGroupService.finalize_property_unit_groups(property=property_obj, user=request.user, groups_data=groups_data)
+            created_groups = UnitGroupService.finalize_property_unit_groups(property_obj=property_obj, user=request.user, groups_data=groups_data)
             serializer = prop_serializers.UnitGroupSerializer(created_groups, many=True)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         except Exception as e:
@@ -134,7 +247,6 @@ class PropertyViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='tenant-financials', permission_classes=[permissions.IsAuthenticated])
     def tenant_financials(self, request, pk=None):
         property_obj = self.get_object()
-        # ✅ ADDED: tenant__profile to select_related for performance & guaranteed access
         tenancies = Tenancy.objects.filter(
             property=property_obj, 
             status='active'
@@ -143,8 +255,6 @@ class PropertyViewSet(viewsets.ModelViewSet):
         data = []
         for tenancy in tenancies:
             tenant_user = tenancy.tenant
-            
-            # ✅ CRITICAL FIX: Strictly use Profile full_name. NO email fallback.
             profile = getattr(tenant_user, 'profile', None)
             tenant_name = getattr(profile, 'full_name', None) or "Unnamed Tenant"
             
@@ -152,9 +262,9 @@ class PropertyViewSet(viewsets.ModelViewSet):
             nok_data = {"full_name": nok.full_name, "relationship": nok.relationship, "phone_number": nok.phone_number, "city": nok.city} if nok else None
             
             data.append({
-                "tenancy_id": tenancy.id,  # ✅ ADDED: Needed for notes
+                "tenancy_id": tenancy.id,
                 "tenant_id": tenant_user.id, 
-                "tenant_name": tenant_name, # ✅ Uses Profile full_name strictly
+                "tenant_name": tenant_name,
                 "tenant_email": tenant_user.email, 
                 "tenant_phone": getattr(tenant_user, 'phone_number', '') or (getattr(profile, 'phone_number', '') if profile else ''),
                 "property_name": property_obj.title, 
@@ -179,14 +289,21 @@ class UnitGroupViewSet(viewsets.ModelViewSet):
     serializer_class = prop_serializers.UnitGroupSerializer
     permission_classes = [permissions.IsAuthenticated, IsOwnerOrDelegated]
     parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
-    
-    # ✅ CRITICAL FIX: Disable pagination so ALL unit groups are returned to the frontend
     pagination_class = None
 
     def get_queryset(self):
         if getattr(self, 'swagger_fake_view', False): return UnitGroup.objects.none()
         property_pk = self.kwargs.get('property_pk')
-        return UnitGroup.objects.filter(property_id=property_pk)
+        
+        # 🚀 PERFORMANCE FIX: Annotate counts to prevent N+1 queries in UnitGroupSerializer
+        return UnitGroup.objects.filter(property_id=property_pk).annotate(
+            actual_units_count=Count('units', distinct=True),
+            occupied_units_count=Count(
+                'units',
+                filter=Q(units__tenancies__status__in=['active', 'extended', 'pending_payment']),
+                distinct=True
+            )
+        )
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -206,16 +323,12 @@ class UnitViewSet(viewsets.ModelViewSet):
     serializer_class = prop_serializers.UnitSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
-    
-    # ✅ CRITICAL FIX: Disable pagination so ALL 50+ units are returned to the frontend
     pagination_class = None
 
     def get_queryset(self):
         if getattr(self, 'swagger_fake_view', False): return Unit.objects.none()
         property_pk = self.kwargs.get('property_pk')
         
-        # ✅ CRITICAL FIX: Annotate queryset with active tenancy status
-        # This prevents N+1 query issues when the serializer checks for tenancies
         active_tenancy = Tenancy.objects.filter(
             unit=OuterRef('pk'),
             status__in=['active', 'extended', 'pending_payment']
@@ -231,25 +344,18 @@ class UnitViewSet(viewsets.ModelViewSet):
             context['property'] = Property.objects.get(id=self.kwargs.get('property_pk'))
         return context
 
-    # ✅ CRITICAL FIX: Corrected permission logic AND instantiated all permission classes
     def get_permissions(self):
-        # 1. If the user is NOT logged in (Public Marketplace Browsing)
         if not self.request.user.is_authenticated:
             if self.action in ['list', 'retrieve']:
                 return [IsMarketplaceReadOnly()]
-            # Block all other actions (create, update, delete) for public users
             return [permissions.IsAuthenticated()] 
         
-        # 2. If the user IS logged in (Tenants, Landlords, Agencies)
-        # Any authenticated user can VIEW units (e.g., a tenant reviewing a unit before applying)
         if self.action in ['list', 'retrieve']:
             return [permissions.IsAuthenticated()] 
         
-        # 3. Destructive actions require strict ownership
         if self.action == 'destroy':
             return [IsPropertyOwnerOrManager()]
             
-        # 4. Create/Update actions require ownership or delegation
         return [IsOwnerOrDelegated()]
 
     def destroy(self, request, *args, **kwargs):

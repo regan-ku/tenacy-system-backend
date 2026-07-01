@@ -5,11 +5,11 @@ from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResp
 
 from django.contrib.auth import get_user_model
 from django.apps import apps
-# ✅ CRITICAL FIX: Import Q objects for safe OR queries
+from django.core.exceptions import ValidationError
 from django.db.models import Q 
 
 from . import serializers
-from ..models import Agency, AgencyDirector, AgencyVerification, AgencyProfile, AgencyStaff, DelegatedProperty
+from ..models import Agency, AgencyDirector, AgencyVerification, AgencyProfile, AgencyStaff, DelegatedProperty, AgencyActivityLog
 from ..services import AgencyService, AgencyVerificationService, StaffService, DelegationService, AgencyProfileService
 from ..permissions.agency_permissions import IsAgencyAdmin
 
@@ -27,7 +27,6 @@ class AgencyViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        # ✅ FIX: Prevent drf-spectacular from crashing during schema generation
         if getattr(self, 'swagger_fake_view', False):
             return Agency.objects.none()
             
@@ -35,11 +34,9 @@ class AgencyViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             return Agency.objects.none()
             
-        # ✅ FIX: Use getattr to prevent AttributeError if 'role' is missing
         if getattr(user, 'role', None) == 'admin':
             return Agency.objects.all().select_related('business_profile')
         
-        # ✅ CRITICAL FIX: Use Q objects for OR queries to prevent 500 SQL join errors
         return Agency.objects.filter(
             Q(created_by=user) | 
             Q(directors__user=user) | 
@@ -164,8 +161,46 @@ class DelegationViewSet(viewsets.ModelViewSet):
         agency = Agency.objects.get(id=agency_pk)
         DelegationService.delegate_property(agency, serializer.validated_data)
 
+    @extend_schema(
+        summary="Revoke Property Delegation (Landlord Action)",
+        responses={200: OpenApiResponse(description="Delegation revoked successfully")}
+    )
     @action(detail=True, methods=['POST'], url_path='revoke')
     def revoke(self, request, pk=None, agency_pk=None):
         delegation = self.get_object()
-        DelegationService.revoke_delegation(delegation)
+        reason = request.data.get('reason', 'No reason provided.')
+        DelegationService.revoke_delegation(delegation, request.user, reason)
         return Response({"status": "revoked", "message": "Delegation revoked successfully."})
+
+    # ✅ NEW: AGENCY RELINQUISHMENT ENDPOINT
+    @extend_schema(
+        summary="Relinquish Property Delegation (Agency Action)",
+        description="Agency voluntarily gives up management of a delegated property. Notifies tenants and updates staff access.",
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'reason': {'type': 'string', 'description': 'Reason for relinquishing management.'}
+                },
+                'required': ['reason']
+            }
+        },
+        responses={200: OpenApiResponse(description="Delegation relinquished successfully")}
+    )
+    @action(detail=True, methods=['POST'], url_path='relinquish')
+    def relinquish(self, request, pk=None, agency_pk=None):
+        delegation = self.get_object()
+        reason = request.data.get('reason', 'No reason provided.')
+        
+        try:
+            DelegationService.relinquish_delegation(
+                delegation=delegation,
+                relinquishing_user=request.user,
+                reason=reason
+            )
+            return Response({
+                "status": "relinquished", 
+                "message": "Delegation relinquished successfully. Tenants have been notified and staff access updated."
+            }, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)

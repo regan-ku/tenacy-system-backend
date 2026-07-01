@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils.html import format_html
 from .models import (
     Agency, AgencyDirector, AgencyVerification, AgencyProfile,
-    AgencyStaff, AgencyRole, DelegatedProperty, AgencyPermission, AgencyActivityLog
+    AgencyStaff, AgencyRole, DelegatedProperty, AgencyActivityLog # ✅ REMOVED AgencyPermission
 )
 from .services import AgencyVerificationService, DirectorService
 
@@ -79,12 +79,12 @@ class AgencyVerificationAdmin(admin.ModelAdmin):
         self.message_user(request, f"Successfully rejected {queryset.count()} agency verifications.")
 
 # ---------------------------------------------------------
-# 4. DELEGATED PROPERTY ADMIN
+# 4. DELEGATED PROPERTY ADMIN (UPDATED: Full Delegation Only)
 # ---------------------------------------------------------
 @admin.register(DelegatedProperty)
 class DelegatedPropertyAdmin(admin.ModelAdmin):
-    list_display = ('property_ref', 'agency_name', 'delegation_type', 'status', 'start_date')
-    list_filter = ('status', 'delegation_type', 'start_date')
+    list_display = ('property_ref', 'agency_name', 'status', 'start_date', 'end_date')
+    list_filter = ('status', 'start_date')
     search_fields = ('property_ref__title', 'agency__name')
     readonly_fields = ('created_at', 'updated_at', 'revoked_at', 'revoked_by')
 
@@ -93,7 +93,32 @@ class DelegatedPropertyAdmin(admin.ModelAdmin):
     agency_name.short_description = 'Agency'
 
 # ---------------------------------------------------------
-# 5. AGENCY ACTIVITY LOG ADMIN (Read-Only Audit Trail)
+# 5. AGENCY STAFF ADMIN (UPDATED: Dedicated UI for Staff)
+# ---------------------------------------------------------
+@admin.register(AgencyStaff)
+class AgencyStaffAdmin(admin.ModelAdmin):
+    list_display = ('user_email', 'full_name', 'role', 'agency_name', 'status', 'joined_at')
+    list_filter = ('role', 'status', 'agency')
+    search_fields = ('user__email', 'user__profile__full_name', 'contact_email', 'contact_phone')
+    readonly_fields = ('joined_at', 'terminated_at')
+    raw_id_fields = ('user', 'agency')
+
+    def user_email(self, obj):
+        return obj.user.email if obj.user else 'No User Linked'
+    user_email.short_description = 'User Email'
+
+    def full_name(self, obj):
+        if obj.user and hasattr(obj.user, 'profile') and obj.user.profile.full_name:
+            return obj.user.profile.full_name
+        return obj.contact_email or 'N/A'
+    full_name.short_description = 'Full Name'
+
+    def agency_name(self, obj):
+        return obj.agency.name if obj.agency else 'Direct Landlord Assignment'
+    agency_name.short_description = 'Agency'
+
+# ---------------------------------------------------------
+# 6. AGENCY ACTIVITY LOG ADMIN (Read-Only Audit Trail)
 # ---------------------------------------------------------
 @admin.register(AgencyActivityLog)
 class AgencyActivityLogAdmin(admin.ModelAdmin):
@@ -116,6 +141,5 @@ class AgencyActivityLogAdmin(admin.ModelAdmin):
 
 # Register remaining models with basic admin config
 admin.site.register(AgencyProfile)
-admin.site.register(AgencyStaff)
 admin.site.register(AgencyRole)
-admin.site.register(AgencyPermission)
+# ✅ REMOVED: admin.site.register(AgencyPermission)

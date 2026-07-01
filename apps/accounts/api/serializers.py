@@ -16,7 +16,6 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
     phone_number = serializers.CharField(max_length=20)
     role = serializers.ChoiceField(choices=User.Role.choices, default=User.Role.TENANT)
     
-    # ✅ FIX: Make username completely optional for the frontend
     username = serializers.CharField(required=False, allow_blank=True, write_only=True)
 
     class Meta:
@@ -27,19 +26,16 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         }
 
     def validate_email(self, value):
-        # ✅ Force lowercase and strip spaces before checking existence
         value = value.strip().lower()
         if User.objects.filter(email=value).exists():
             raise serializers.ValidationError("A user with this email already exists.")
         return value
 
     def create(self, validated_data):
-        # ✅ Clean data
         email = validated_data.pop('email').strip().lower()
         password = validated_data.pop('password')
         phone = validated_data.get('phone_number', '').strip()
         
-        # ✅ HANDLE OPTIONAL USERNAME:
         username = validated_data.pop('username', '').strip()
         if not username and getattr(User, 'USERNAME_FIELD', None) == 'username':
             username = email.split('@')[0] 
@@ -190,6 +186,7 @@ class VerificationSerializer(serializers.ModelSerializer):
 class UserStateResponseSerializer(serializers.Serializer):
     """Defines the exact shape of the Post-Login User State Resolution Engine response."""
     profile_complete = serializers.BooleanField()
+    tenant_profile_complete = serializers.BooleanField(required=False, default=True) 
     role = serializers.CharField()
     next_route = serializers.CharField(help_text="The exact frontend route the user should be redirected to.")
     message = serializers.CharField(help_text="Human-readable message explaining the redirection.")
@@ -213,13 +210,25 @@ class StaffCreateSerializer(serializers.Serializer):
     full_name = serializers.CharField(max_length=255)
     email = serializers.EmailField()
     phone_number = serializers.CharField(max_length=25, required=False, allow_blank=True)
-    role = serializers.ChoiceField(choices=[User.Role.AGENT, User.Role.CARETAKER])
+    
+    # ✅ FIXED: Explicitly allow 'property_manager' even though it's not a User.Role
+    role = serializers.ChoiceField(
+        choices=[
+            (User.Role.AGENT, 'Agent'), 
+            (User.Role.CARETAKER, 'Caretaker'), 
+            ('property_manager', 'Property Manager')
+        ]
+    )
 
     def create(self, validated_data):
         manager_user = self.context['request'].user
+        
+        # Permission check: Only managers, landlords, agencies, or admins can do this
         allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
+            
         if manager_user.role not in allowed_roles:
             raise serializers.ValidationError("You do not have permission to create staff accounts.")
+            
         return UserService.create_staff_for_manager(manager_user, validated_data)
 
 class TenantIdentitySerializer(serializers.Serializer):
@@ -254,10 +263,9 @@ class ManagerCreateTenantSerializer(serializers.Serializer):
     def create(self, validated_data):
         manager_user = self.context['request'].user
         
-        # Permission check: Only managers, landlords, agencies, or admins can do this
         allowed_roles = [User.Role.LANDLORD, User.Role.AGENCY, User.Role.AGENT, User.Role.ADMIN]
+            
         if manager_user.role not in allowed_roles:
             raise serializers.ValidationError("You do not have permission to manage tenant accounts.")
             
-        # The service handles the actual creation/update and returns the user + temp password
         return UserService.create_or_update_tenant_for_manager(manager_user, validated_data)

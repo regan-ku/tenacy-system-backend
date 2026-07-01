@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Property, Location, UnitGroup, Unit, PropertyMedia
+from .models import Property, Location, UnitGroup, Unit, PropertyMedia, PropertyStaffAssignment # ✅ ADDED PropertyStaffAssignment
 
 @admin.register(Location)
 class LocationAdmin(admin.ModelAdmin):
@@ -31,11 +31,9 @@ class PropertyAdmin(admin.ModelAdmin):
     list_filter = ('property_category', 'property_sub_type', 'is_active', 'is_published', 'listing_type', 'ownership_status')
     search_fields = ('title', 'description', 'location__city', 'location__county')
     
-    # ✅ ADDED: display_location_details to readonly fields
     readonly_fields = ('created_at', 'updated_at', 'display_location_details')
     raw_id_fields = ('created_by', 'current_manager')
     
-    # ✅ ADDED: Inlines for Units and Unit Groups
     inlines = [UnitGroupInline, UnitInline]
     
     fieldsets = (
@@ -43,7 +41,6 @@ class PropertyAdmin(admin.ModelAdmin):
         ('Ownership & Management', {'fields': ('created_by', 'current_manager', 'ownership_status')}),
         ('Classification', {'fields': ('property_category', 'property_sub_type', 'construction_type')}),
         
-        # ✅ NEW: Dedicated Location Section with Read-Only Address Details
         ('Location Details', {
             'fields': ('location', 'display_location_details'),
             'description': 'The location object is linked here. Full address and GPS details are auto-generated via geo-coding.'
@@ -66,7 +63,6 @@ class PropertyAdmin(admin.ModelAdmin):
         return "No Location"
     location_city.short_description = 'Location'
 
-    # ✅ NEW: Method to display full location details directly on the Property page
     def display_location_details(self, obj):
         if obj.location:
             loc = obj.location
@@ -93,18 +89,11 @@ class UnitGroupAdmin(admin.ModelAdmin):
 
 @admin.register(Unit)
 class UnitAdmin(admin.ModelAdmin):
-    # ✅ ADDED: unit_group_name to display
     list_display = ('unit_code', 'property_title', 'unit_group_name', 'unit_type', 'floor_number', 'rent_amount', 'status')
-    
-    # ✅ ADDED: property_ref and unit_group to filters. 
-    # Now you can select "Kilimai Apartment" from the right sidebar and see EXACTLY how many units it has.
     list_filter = ('property_ref', 'unit_group', 'status', 'unit_type', 'billing_cycle')
-    
     search_fields = ('unit_code', 'property_ref__title')
     readonly_fields = ('created_at', 'updated_at')
     raw_id_fields = ('property_ref', 'unit_group')
-    
-    # ✅ CRITICAL PERFORMANCE FIX: Prevents N+1 query issues when loading 50+ units
     list_select_related = ('property_ref', 'unit_group')
 
     def property_title(self, obj):
@@ -112,7 +101,6 @@ class UnitAdmin(admin.ModelAdmin):
     property_title.short_description = 'Property'
     property_title.admin_order_field = 'property_ref__title'
 
-    # ✅ NEW: Display Unit Group clearly
     def unit_group_name(self, obj):
         return obj.unit_group.name if obj.unit_group else "—"
     unit_group_name.short_description = 'Unit Group'
@@ -133,3 +121,32 @@ class PropertyMediaAdmin(admin.ModelAdmin):
     def unit_code(self, obj):
         return obj.unit.unit_code if obj.unit else 'N/A'
     unit_code.short_description = 'Unit Code'
+
+
+# ==========================================
+# ✅ NEW: PROPERTY STAFF ASSIGNMENT ADMIN
+# ==========================================
+@admin.register(PropertyStaffAssignment)
+class PropertyStaffAssignmentAdmin(admin.ModelAdmin):
+    """
+    Admin interface for managing operational staff assignments to specific properties.
+    Tracks whether the staff member was assigned by the Landlord or the delegated Agency.
+    """
+    list_display = ('property_title', 'user_email', 'operational_role', 'assigned_by_entity_type', 'assigned_by_agency_name', 'is_active', 'assigned_at')
+    list_filter = ('operational_role', 'assigned_by_entity_type', 'is_active')
+    search_fields = ('property__title', 'user__email', 'user__profile__full_name')
+    readonly_fields = ('assigned_at', 'terminated_at')
+    raw_id_fields = ('property', 'user', 'assigned_by_agency')
+
+    def property_title(self, obj):
+        return obj.property.title
+    property_title.short_description = 'Property'
+    property_title.admin_order_field = 'property__title'
+
+    def user_email(self, obj):
+        return obj.user.email
+    user_email.short_description = 'User Email'
+
+    def assigned_by_agency_name(self, obj):
+        return obj.assigned_by_agency.name if obj.assigned_by_agency else 'N/A (Direct Landlord)'
+    assigned_by_agency_name.short_description = 'Assigned By Agency'

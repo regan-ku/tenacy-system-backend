@@ -2,10 +2,10 @@ from rest_framework import serializers
 from drf_spectacular.utils import extend_schema_field
 
 from ..models import Property, Location, UnitGroup, Unit, PropertyMedia
+from ..models.staff_assignment import PropertyStaffAssignment
 from ..models.enums import PropertyCategory, PropertySubType, UnitType, UnitStatus, BillingCycle, ConstructionType
 from ..services import PropertyService, UnitGroupService, UnitService, LocationService, MediaService
 
-# ✅ ADDED IMPORT: Needed to dynamically check for active tenancies
 from apps.tenancy.models.tenancy import Tenancy 
 
 
@@ -46,8 +46,8 @@ class PropertySerializer(serializers.ModelSerializer):
 
     landlord_name = serializers.SerializerMethodField()
     delegation_info = serializers.SerializerMethodField()
+    delegation_id = serializers.SerializerMethodField()
     
-    # ✅ NEW: Occupancy rate calculation
     occupancy_rate = serializers.SerializerMethodField()
     total_units = serializers.SerializerMethodField()
 
@@ -61,9 +61,12 @@ class PropertySerializer(serializers.ModelSerializer):
             'has_cctv', 'has_elevator', 'has_generator', 'has_gym', 'has_swimming_pool', 
             'listing_type', 'is_published', 'allows_pets', 'parking_spaces',
             'location', 'is_active', 'location_details', 
-            'landlord_name', 'delegation_info', 'occupancy_rate', 'total_units'
+            'landlord_name', 'delegation_info', 'delegation_id', 'occupancy_rate', 'total_units'
         ]
-        read_only_fields = ['id', 'created_by_email', 'is_active', 'location_details', 'landlord_name', 'delegation_info', 'occupancy_rate', 'total_units']
+        read_only_fields = [
+            'id', 'created_by_email', 'is_active', 'location_details', 
+            'landlord_name', 'delegation_info', 'delegation_id', 'occupancy_rate', 'total_units'
+        ]
 
     @extend_schema_field(LocationSerializer)
     def get_location_details(self, obj):
@@ -90,28 +93,23 @@ class PropertySerializer(serializers.ModelSerializer):
             }
         return None
 
-    # ✅ NEW: Calculate total actual units in the property
-    def get_total_units(self, obj):
-        """Returns the actual number of units created in this property."""
-        return obj.units.count()
+    def get_delegation_id(self, obj):
+        if hasattr(obj, 'active_agency_delegation') and obj.active_agency_delegation:
+            return obj.active_agency_delegation[0].id
+        active_delegation = obj.agency_delegations.filter(status='active').first()
+        return active_delegation.id if active_delegation else None
 
-    # ✅ NEW: Calculate occupancy rate from Tenancy model
+    # 🚀 PERFORMANCE FIX: Read annotated values to prevent N+1 queries
+    def get_total_units(self, obj):
+        return getattr(obj, 'total_units_count', obj.units.count())
+
     def get_occupancy_rate(self, obj):
-        """
-        Calculates the occupancy rate by querying the Tenancy model.
-        Returns a percentage (0-100) rounded to 1 decimal place.
-        """
-        total_units = obj.units.count()
-        
+        total_units = getattr(obj, 'total_units_count', obj.units.count())
         if total_units == 0:
             return 0
-        
-        # Count units with active tenancies
-        occupied_units = obj.units.filter(
+        occupied_units = getattr(obj, 'occupied_units_count', obj.units.filter(
             tenancies__status__in=['active', 'extended', 'pending_payment']
-        ).distinct().count()
-        
-        # Calculate percentage
+        ).distinct().count())
         rate = (occupied_units / total_units) * 100
         return round(rate, 1)
 
@@ -138,7 +136,6 @@ class PropertySerializer(serializers.ModelSerializer):
         return PropertyService.update_property(instance, user, validated_data)
 
 
-# ✅ UPDATED: UnitGroupSerializer now includes occupancy stats
 class UnitGroupSerializer(serializers.ModelSerializer):
     unit_type = serializers.ChoiceField(choices=UnitType.choices)
     billing_cycle = serializers.ChoiceField(choices=BillingCycle.choices)
@@ -162,21 +159,16 @@ class UnitGroupSerializer(serializers.ModelSerializer):
             'cover_photo': {'help_text': 'Upload a cover image for this specific unit group.'}
         }
 
+    # 🚀 PERFORMANCE FIX: Read annotated values to prevent N+1 queries
     def get_actual_units_count(self, obj):
-        """Returns the exact number of units currently existing in this group."""
-        return obj.units.count()
+        return getattr(obj, 'actual_units_count', obj.units.count())
 
     def get_occupied_units(self, obj):
-        """
-        ✅ SOURCE OF TRUTH: Queries the Tenancy app for active tenancies
-        to determine how many units in this group are currently occupied.
-        """
-        return obj.units.filter(
+        return getattr(obj, 'occupied_units_count', obj.units.filter(
             tenancies__status__in=['active', 'extended', 'pending_payment']
-        ).distinct().count()
+        ).distinct().count())
 
     def get_available_units(self, obj):
-        """Calculates available units by subtracting occupied from total actual units."""
         total = self.get_actual_units_count(obj)
         occupied = self.get_occupied_units(obj)
         return max(0, total - occupied)
@@ -184,7 +176,6 @@ class UnitGroupSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         property_obj = self.context['property']
         user = self.context['request'].user
-        
         return UnitGroupService.create_unit_group(
             property=property_obj,
             created_by_user=user,
@@ -210,8 +201,6 @@ class UnitSerializer(serializers.ModelSerializer):
     allows_pets = serializers.SerializerMethodField()
     parking_spaces = serializers.SerializerMethodField()
     currency = serializers.SerializerMethodField()
-    
-    # ✅ CRITICAL FIX: Override status to dynamically check for active tenancies
     status = serializers.SerializerMethodField()
 
     class Meta:
@@ -246,22 +235,13 @@ class UnitSerializer(serializers.ModelSerializer):
     def get_currency(self, obj):
         return obj.unit_group.currency if obj.unit_group else 'KES'
 
-    # ✅ CRITICAL FIX: Dynamically return 'occupied' if an active tenancy exists
     def get_status(self, obj):
-        """
-        Dynamically checks the Tenancy model to ensure the frontend always 
-        sees the ground truth, even if the database Unit.status column is stale.
-        """
-        # 1. Use the annotated field if available (prevents N+1 queries)
         if hasattr(obj, 'has_active_tenancy'):
             return 'occupied' if obj.has_active_tenancy else obj.status
-        
-        # 2. Fallback: Direct DB query (only happens if annotation is missing)
         has_active = Tenancy.objects.filter(
             unit=obj, 
             status__in=['active', 'extended', 'pending_payment']
         ).exists()
-        
         return 'occupied' if has_active else obj.status
 
     def create(self, validated_data):
@@ -315,3 +295,36 @@ class PropertyMediaSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         return super().create(validated_data)
+
+
+class PropertyStaffAssignmentSerializer(serializers.ModelSerializer):
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_name = serializers.SerializerMethodField()
+    user_phone = serializers.CharField(source='user.phone_number', read_only=True, allow_null=True) 
+    assigned_by_agency_name = serializers.CharField(source='assigned_by_agency.name', read_only=True, allow_null=True)
+    
+    class Meta:
+        model = PropertyStaffAssignment
+        fields = [
+            'id', 'user', 'user_email', 'user_name', 'user_phone', 'operational_role',
+            'assigned_by_entity_type', 'assigned_by_agency', 'assigned_by_agency_name',
+            'is_active', 'assigned_at', 'terminated_at', 'notes'
+        ]
+        read_only_fields = [
+            'id', 'assigned_by_entity_type', 'assigned_by_agency', 
+            'assigned_at', 'terminated_at', 'is_active'
+        ]
+
+    def get_user_name(self, obj):
+        if hasattr(obj.user, 'profile') and obj.user.profile.full_name:
+            return obj.user.profile.full_name
+        return obj.user.email
+
+
+class AssignStaffRequestSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField(help_text="ID of the user to assign")
+    operational_role = serializers.ChoiceField(
+        choices=PropertyStaffAssignment.OperationalRole.choices,
+        help_text="The operational hat the user will wear for this property."
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, help_text="Optional internal notes.")
