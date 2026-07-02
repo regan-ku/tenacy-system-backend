@@ -100,6 +100,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
 
         # ==========================================
         # 🚀 PERFORMANCE FIX: ANNOTATE COUNTS TO PREVENT N+1 QUERIES
+        # ✅ FIXED: Calculate occupancy based on ACTIVE TENANCIES, not Unit.status column
         # ==========================================
         qs = qs.annotate(
             total_units_count=Count('units', distinct=True),
@@ -296,6 +297,7 @@ class UnitGroupViewSet(viewsets.ModelViewSet):
         property_pk = self.kwargs.get('property_pk')
         
         # 🚀 PERFORMANCE FIX: Annotate counts to prevent N+1 queries in UnitGroupSerializer
+        # ✅ FIXED: Calculate occupancy based on ACTIVE TENANCIES, not Unit.status column
         return UnitGroup.objects.filter(property_id=property_pk).annotate(
             actual_units_count=Count('units', distinct=True),
             occupied_units_count=Count(
@@ -329,14 +331,8 @@ class UnitViewSet(viewsets.ModelViewSet):
         if getattr(self, 'swagger_fake_view', False): return Unit.objects.none()
         property_pk = self.kwargs.get('property_pk')
         
-        active_tenancy = Tenancy.objects.filter(
-            unit=OuterRef('pk'),
-            status__in=['active', 'extended', 'pending_payment']
-        )
-        
-        return Unit.objects.filter(property_ref_id=property_pk).select_related('property_ref', 'unit_group').annotate(
-            has_active_tenancy=Exists(active_tenancy)
-        )
+        # ✅ UPDATED: Removed tenancy subquery. We now rely purely on the Unit model's status field.
+        return Unit.objects.filter(property_ref_id=property_pk).select_related('property_ref', 'unit_group')
 
     def get_serializer_context(self):
         context = super().get_serializer_context()

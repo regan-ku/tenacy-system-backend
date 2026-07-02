@@ -1,48 +1,69 @@
 from django.db.models import Q
 from django.contrib.auth import get_user_model
+from django.apps import apps
 
 User = get_user_model()
 
 class ReportFilterUtils:
     """
-    Reusable queryset filtering logic to ensure reports are strictly scoped 
-    to the requesting user's role and property assignments.
+    Universal data scoping utility for the Reports and Dashboards apps.
+    Ensures strict role-based data isolation across all aggregators.
     """
 
     @staticmethod
-    def scope_properties_by_user(user, queryset):
+    def scope_properties_by_user(user, base_queryset=None):
         """
-        Filters a Property or Unit queryset to only include what the user is allowed to see.
+        Filters a Property queryset to only include what the user is allowed to see.
         """
+        if base_queryset is None:
+            Property = apps.get_model('properties', 'Property')
+            base_queryset = Property.objects.all()
+
+        # 1. SYSTEM ADMINISTRATOR
         if user.role == 'admin':
-            return queryset # Admin sees everything
+            return base_queryset
+
+        # 2. LANDLORD
+        # Landlords see all properties they created, regardless of whether 
+        # they have delegated operational control to an agency.
+        elif user.role == 'landlord':
+            return base_queryset.filter(created_by=user)
+
+        # 3. AGENCY
+        # Agencies see properties they own AND properties delegated to them.
+        elif user.role == 'agency':
+            Agency = apps.get_model('agencies', 'Agency')
             
-        if user.role == 'landlord':
-            return queryset.filter(created_by=user)
+            # Find all agencies this user is associated with (Owner, Director, or Staff)
+            user_agencies = Agency.objects.filter(
+                Q(created_by=user) | 
+                Q(directors__user=user) | 
+                Q(staff_members__user=user, staff_members__status='active')
+            )
             
-        if user.role in ['agency', 'manager']:
-            # Agency/Manager sees properties they own OR properties delegated to them
-            return queryset.filter(
-                Q(created_by=user) | Q(current_manager=user)
+            return base_queryset.filter(
+                Q(created_by=user) | 
+                Q(agency_delegations__agency__in=user_agencies, agency_delegations__status='active')
             ).distinct()
-            
-        if user.role == 'agent':
-            # Agents only see properties assigned to their parent agency
-            if hasattr(user, 'agency') and user.agency:
-                return queryset.filter(current_manager=user.agency)
-            return queryset.none()
-            
-        if user.role == 'caretaker':
-            # Caretakers only see properties they are directly assigned to
-            return queryset.filter(caretaker=user)
-            
-        if user.role == 'tenant':
-            # Tenants only see the specific units/properties they occupy
-            from tenancy.models import Tenancy
-            occupied_units = Tenancy.objects.filter(tenant=user, status__in=['active', 'extended']).values_list('unit__property', flat=True)
-            return queryset.filter(id__in=occupied_units).distinct()
-            
-        return queryset.none()
+
+        # 4. STAFF (Agent, Caretaker, Property Manager)
+        # Staff only see properties they are explicitly assigned to via PropertyStaffAssignment.
+        elif user.role in ['agent', 'caretaker', 'property_manager']:
+            return base_queryset.filter(
+                staff_assignments__user=user,
+                staff_assignments__is_active=True
+            ).distinct()
+
+        # 5. TENANT
+        # Tenants only see properties where they hold an active tenancy.
+        elif user.role == 'tenant':
+            return base_queryset.filter(
+                units__tenancies__tenant=user,
+                units__tenancies__status__in=['active', 'extended', 'pending_payment']
+            ).distinct()
+
+        # Fallback for unknown roles (returns empty queryset)
+        return base_queryset.none()
 
     @staticmethod
     def apply_date_range(queryset, date_field: str, start_date=None, end_date=None):

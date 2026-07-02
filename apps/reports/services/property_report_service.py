@@ -16,9 +16,6 @@ class PropertyReportService:
     @staticmethod
     @transaction.atomic
     def initiate_property_report(user, title: str, parameters: dict) -> Report:
-        """
-        Creates a Report record and triggers background processing for property data.
-        """
         report = Report.objects.create(
             title=title,
             report_type=Report.ReportType.OCCUPANCY, # Reusing OCCUPANCY or add PROPERTY to choices if needed
@@ -32,9 +29,6 @@ class PropertyReportService:
 
     @staticmethod
     def _process_report(report_id: int):
-        """
-        Core processing logic for the property portfolio report.
-        """
         try:
             report = Report.objects.select_related('generated_by').get(id=report_id)
             report.status = Report.Status.PROCESSING
@@ -60,12 +54,12 @@ class PropertyReportService:
                 snapshot_data=snapshot_payload
             )
 
-            # 3. Generate Export (PDF for formal portfolio summaries)
+            # 3. Generate Export using DocumentTemplate system
             filename = f"property_portfolio_report_{report.id}_{timezone.now().strftime('%Y%m%d')}.pdf"
-            export_result = PDFExporter.generate_pdf_from_template(
-                "reports/property_portfolio_report.html",
-                {"data": snapshot_payload, "user": user.email},
-                filename
+            export_result = PDFExporter.generate_pdf_from_document_template(
+                document_type_code="property_portfolio_report", # Must match DocumentType.code in DB
+                variables={"data": snapshot_payload, "user": user.email},
+                filename=filename
             )
 
             if export_result["success"]:

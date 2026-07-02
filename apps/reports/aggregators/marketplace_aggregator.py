@@ -1,4 +1,4 @@
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, Q
 from django.utils import timezone
 from datetime import timedelta
 from django.apps import apps
@@ -17,17 +17,17 @@ class MarketplaceAggregator:
         Returns total listing views, inquiries (saved listings/applications), 
         and conversion rates scoped to the user's properties.
         """
-        # ListingView IS accessed here, so it correctly stays
         ListingView = apps.get_model('marketplace', 'ListingView')
         SavedListing = apps.get_model('marketplace', 'SavedListing')
         Property = apps.get_model('properties', 'Property')
+        Application = apps.get_model('applications', 'Application')
 
-        # 1. Scope properties to the user
         accessible_properties = ReportFilterUtils.scope_properties_by_user(user, Property.objects.all())
         property_ids = accessible_properties.values_list('id', flat=True)
 
         if not property_ids:
             return {
+                "period_days": days,
                 "total_views": 0,
                 "total_saved": 0,
                 "total_applications": 0,
@@ -36,27 +36,22 @@ class MarketplaceAggregator:
 
         cutoff_date = timezone.now() - timedelta(days=days)
 
-        # 2. Aggregate Views
         total_views = ListingView.objects.filter(
             listing__property_id__in=property_ids,
             viewed_at__gte=cutoff_date
         ).count()
 
-        # 3. Aggregate Saved Listings (Inquiries/Interest)
         total_saved = SavedListing.objects.filter(
             listing__property_id__in=property_ids,
             created_at__gte=cutoff_date
         ).count()
 
-        # 4. Aggregate Applications (Conversions)
-        Application = apps.get_model('applications', 'Application')
         total_applications = Application.objects.filter(
             property_id__in=property_ids,
             created_at__gte=cutoff_date,
-            status='approved' # Count successful conversions
+            status='approved' 
         ).count()
 
-        # 5. Calculate Conversion Rate (Applications / Views)
         conversion_rate = CalculationUtils.calculate_percentage(total_applications, total_views)
 
         return {
@@ -74,7 +69,6 @@ class MarketplaceAggregator:
         """
         Listing = apps.get_model('marketplace', 'Listing')
         Property = apps.get_model('properties', 'Property')
-        # ✅ REMOVED unused 'ListingView' fetch. Django resolves the string 'listingview' automatically.
 
         accessible_properties = ReportFilterUtils.scope_properties_by_user(user, Property.objects.all())
         property_ids = accessible_properties.values_list('id', flat=True)

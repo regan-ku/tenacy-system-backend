@@ -3,9 +3,8 @@ import os
 from django.conf import settings
 from django.utils import timezone
 
-# In production, install: pip install openpyxl
+# In production, ensure you have: pip install openpyxl
 import openpyxl
-from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 
@@ -16,33 +15,44 @@ class ExcelExporter:
     """
 
     @staticmethod
-    def generate_excel_from_data(data: dict, filename: str, sheet_name: str = "Report Data") -> dict:
-        """
-        Creates an Excel workbook and populates it with the provided snapshot data.
-        """
+    def generate_excel_from_data(data, filename: str, sheet_name: str = "Report Data") -> dict:
         try:
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = sheet_name
 
-            # 1. Add Metadata Header
-            ws.append(["Report Generated At", data.get("generated_at", timezone.now().isoformat())])
-            ws.append(["Period", data.get("period_days", "N/A")])
-            ws.append([""]) # Empty row for spacing
+            # ✅ DYNAMIC HANDLING: Check if data is Tabular (List of Dicts) or Summary (Single Dict)
+            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                # TABULAR DATA (e.g., Landlord Statements, Portfolio Metrics)
+                headers = list(data[0].keys())
+                ws.append([h.replace("_", " ").title() for h in headers])
+                
+                for row in data:
+                    ws.append([row.get(k) for k in headers])
+                    
+            elif isinstance(data, dict):
+                # SUMMARY DATA (e.g., Occupancy Summary, Financial KPIs)
+                ws.append(["Report Generated At", data.get("generated_at", timezone.now().isoformat())])
+                ws.append(["Period", data.get("period_days", "N/A")])
+                ws.append([]) # Empty row for spacing
 
-            # 2. Dynamically add data based on keys (Simplified for structure)
-            # In a full implementation, this would iterate through specific tabular keys 
-            # like data.get('upcoming_expiries') or data.get('application_trend')
-            
-            headers = ["Metric", "Value"]
-            ws.append(headers)
-            
-            # Example: Extracting summary metrics
-            summary = data.get("occupancy_summary", {})
-            for key, value in summary.items():
-                ws.append([key.replace("_", " ").title(), value])
+                # Flatten nested dicts so Excel doesn't break
+                def flatten_dict(d, parent_key='', sep='_'):
+                    items = []
+                    for k, v in d.items():
+                        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                        if isinstance(v, dict):
+                            items.extend(flatten_dict(v, new_key, sep=sep).items())
+                        else:
+                            items.append((new_key, v))
+                    return dict(items)
 
-            # Auto-adjust column widths
+                flat_data = flatten_dict(data)
+                ws.append(["Metric", "Value"])
+                for key, value in flat_data.items():
+                    ws.append([key.replace("_", " ").title(), value])
+
+            # Auto-adjust column widths for readability
             for col in ws.columns:
                 max_length = 0
                 column = col[0].column_letter

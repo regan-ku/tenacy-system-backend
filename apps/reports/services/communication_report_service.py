@@ -15,12 +15,11 @@ class CommunicationReportService:
     @staticmethod
     @transaction.atomic
     def initiate_communication_report(user, title: str, parameters: dict) -> Report:
-        """
-        Creates a Report record and triggers background processing for communication data.
-        """
+        # ⚠️ TODO: Add 'COMMUNICATIONS' to Report.ReportType choices in models.py
+        # For now, we reuse MAINTENANCE to prevent database errors.
         report = Report.objects.create(
             title=title,
-            report_type=Report.ReportType.MAINTENANCE, # Reusing or add COMMUNICATION to choices
+            report_type=Report.ReportType.MAINTENANCE, 
             generated_by=user,
             parameters=parameters,
             status=Report.Status.PENDING
@@ -31,9 +30,6 @@ class CommunicationReportService:
 
     @staticmethod
     def _process_report(report_id: int):
-        """
-        Core processing logic for the communication report.
-        """
         try:
             report = Report.objects.select_related('generated_by').get(id=report_id)
             report.status = Report.Status.PROCESSING
@@ -43,12 +39,8 @@ class CommunicationReportService:
             params = report.parameters
             days = params.get('days', 30)
 
-            # 1. Aggregate Data (Placeholder structure matching integrations/communications models)
-            # from communications.models import CommunicationLog
-            # from reports.utils.filters import ReportFilterUtils
-            # from reports.utils.calculations import CalculationUtils
-            
-            # Simulated payload for structural completeness
+            # 1. Aggregate Data 
+            # TODO: Wire to CommunicationAggregator once the Communications app is built
             snapshot_payload = {
                 "generated_at": timezone.now().isoformat(),
                 "period_days": days,
@@ -65,7 +57,7 @@ class CommunicationReportService:
                 snapshot_data=snapshot_payload
             )
 
-            # 3. Generate Export (Excel for detailed delivery logs)
+            # 3. Generate Export
             filename = f"communication_report_{report.id}_{timezone.now().strftime('%Y%m%d')}.xlsx"
             export_result = ExcelExporter.generate_excel_from_data(
                 snapshot_payload,

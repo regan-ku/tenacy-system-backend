@@ -4,7 +4,7 @@ from django.utils import timezone
 
 from ..models import Report, ReportSnapshot
 from ..aggregators import TenancyAggregator, PropertyAggregator
-from ..exporters.excel_exporter import ExcelExporter # Assuming this exists
+from ..exporters.excel_exporter import ExcelExporter
 
 logger = logging.getLogger(__name__)
 
@@ -16,9 +16,6 @@ class OccupancyReportService:
     @staticmethod
     @transaction.atomic
     def initiate_occupancy_report(user, title: str, parameters: dict) -> Report:
-        """
-        Creates a Report record and triggers background processing for occupancy data.
-        """
         report = Report.objects.create(
             title=title,
             report_type=Report.ReportType.OCCUPANCY,
@@ -32,9 +29,6 @@ class OccupancyReportService:
 
     @staticmethod
     def _process_report(report_id: int):
-        """
-        Core processing logic for the occupancy report.
-        """
         try:
             report = Report.objects.select_related('generated_by').get(id=report_id)
             report.status = Report.Status.PROCESSING
@@ -61,7 +55,7 @@ class OccupancyReportService:
                 snapshot_data=snapshot_payload
             )
 
-            # 3. Generate Export (Excel is often preferred for tabular occupancy data)
+            # 3. Generate Export
             filename = f"occupancy_report_{report.id}_{timezone.now().strftime('%Y%m%d')}.xlsx"
             export_result = ExcelExporter.generate_excel_from_data(
                 snapshot_payload,

@@ -152,7 +152,7 @@ class UserService:
         email = payload.get('email', '').strip().lower()
         phone = payload.get('phone_number') or payload.get('phone')
         full_name = payload.get('full_name')
-        role = payload.get('role', 'agent') # Default to string 'agent' to avoid enum issues early on
+        role = payload.get('role', 'agent') 
 
         if not email:
             raise ValidationError("Email is required.")
@@ -163,9 +163,7 @@ class UserService:
 
         temp_password = f"Temp{secrets.token_urlsafe(8)}!"
 
-        # ✅ CRITICAL FIX: Map frontend roles to valid User.Role choices
-        # Property Managers are stored as 'agent' in the User model, 
-        # but get the 'property_manager' role in the AgencyStaff model.
+        # Map frontend roles to valid User.Role choices
         user_role_map = {
             'agent': User.Role.AGENT,
             'caretaker': User.Role.CARETAKER,
@@ -177,7 +175,7 @@ class UserService:
             email=email,
             password=temp_password,
             phone_number=phone,
-            role=user_role, # Use the mapped User role
+            role=user_role, 
             is_verified=False,
             requires_password_change=True
         )
@@ -188,7 +186,6 @@ class UserService:
             profile_complete=False 
         )
 
-        # ✅ FIXED: Robust AgencyStaff creation without silent failures
         from apps.agencies.models.agency import Agency
         from apps.agencies.models.agency_staff import AgencyStaff
         
@@ -199,7 +196,6 @@ class UserService:
         ).first()
         
         if agency:
-            # ✅ Map to AgencyStaff.StaffRole (which DOES have PROPERTY_MANAGER)
             staff_role_map = {
                 'agent': AgencyStaff.StaffRole.AGENT,
                 'caretaker': AgencyStaff.StaffRole.CARETAKER,
@@ -239,63 +235,109 @@ class UserService:
             Tenancy.objects.filter(tenant=user, status='active').exists()
         )
 
-        # ✅ Define staff roles dynamically to include PROPERTY_MANAGER if it exists
         staff_roles = [User.Role.AGENT, User.Role.CARETAKER]
         if hasattr(User.Role, 'PROPERTY_MANAGER'):
             staff_roles.append(User.Role.PROPERTY_MANAGER)
 
-        # 1. PROFILE CHECK
-        if not profile or not profile.profile_complete:
-            if is_acting_as_tenant:
-                return {
-                    "profile_complete": False,
-                    "role": user.role,
-                    "next_route": "/onboarding",
-                    "message": "Please complete your profile to proceed with your tenancy."
-                }
-            elif user.role in staff_roles:
-                has_basic_profile = profile and profile.full_name and user.phone_number
-                if not has_basic_profile:
-                    return {
-                        "profile_complete": False,
-                        "role": user.role,
-                        "next_route": "/onboarding",
-                        "message": "Please complete your basic profile to access your dashboard."
-                    }
-                
-                if profile and not profile.profile_complete:
-                    profile.profile_complete = True
-                    profile.save(update_fields=['profile_complete'])
-                elif not profile:
-                    Profile.objects.create(user=user, full_name=user.email.split('@')[0], profile_complete=True)
-                
+        # ==========================================
+        # 1. ROLE-AWARE PROFILE COMPLETION CHECK
+        # ==========================================
+        is_profile_complete = False
+        tenant_profile_complete = False # DOB + NOK (Required for renting)
+        
+        # ✅ FIX: Admins bypass standard profile checks and go straight to the dashboard
+        if user.role == User.Role.ADMIN:
+            is_profile_complete = True
+            tenant_profile_complete = True
+
+        elif user.role == User.Role.TENANT:
+            is_profile_complete = bool(profile and profile.profile_complete)
+            if is_profile_complete:
                 has_dob = bool(profile and profile.date_of_birth)
                 has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
-                is_tenant_ready = has_dob and has_nok
+                tenant_profile_complete = has_dob and has_nok
+
+        elif user.role == User.Role.LANDLORD:
+            is_profile_complete = bool(profile and profile.profile_complete)
+            if is_profile_complete:
+                has_dob = bool(profile and profile.date_of_birth)
+                has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
+                tenant_profile_complete = has_dob and has_nok
+
+        elif user.role == User.Role.AGENCY:
+            # Agencies bypass personal User.Profile. They need Business Profile + Director + Verification
+            Agency = apps.get_model('agencies', 'Agency')
+            agency = Agency.objects.filter(
+                Q(created_by=user) | Q(contact_email=user.email)
+            ).first()
+            
+            # If they have an agency record, we consider their business profile complete.
+            is_profile_complete = bool(agency)
+            tenant_profile_complete = False # Agencies don't rent as individuals
+
+        elif user.role in staff_roles:
+            # Staff have a ghost profile. They are "operationally complete" if they have basic info.
+            has_basic_profile = profile and profile.full_name and user.phone_number
+            is_profile_complete = bool(has_basic_profile)
+            
+            if is_profile_complete:
+                has_dob = bool(profile and profile.date_of_birth)
+                has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
+                tenant_profile_complete = has_dob and has_nok
+
+        # If profile is NOT complete, send to onboarding
+        if not is_profile_complete:
+            return {
+                "profile_complete": False,
+                "tenant_profile_complete": False,
+                "role": user.role,
+                "next_route": "/onboarding",
+                "message": "Please complete your profile to continue."
+            }
+
+        # ==========================================
+        # 2. VERIFICATION CHECK (LANDLORD & AGENCY)
+        # ==========================================
+        if user.role in [User.Role.LANDLORD, User.Role.AGENCY]:
+            is_verified = False
+            
+            if user.role == User.Role.LANDLORD:
+                verification = getattr(user, 'verification_record', None)
+                is_verified = bool(verification and verification.status == 'verified')
                 
+            elif user.role == User.Role.AGENCY:
+                Agency = apps.get_model('agencies', 'Agency')
+                AgencyVerification = apps.get_model('agencies', 'AgencyVerification')
+                AgencyDirector = apps.get_model('agencies', 'AgencyDirector')
+                
+                agency = Agency.objects.filter(
+                    Q(created_by=user) | Q(contact_email=user.email)
+                ).first()
+                
+                if agency:
+                    has_verified_director = AgencyDirector.objects.filter(
+                        agency=agency, verification_status='verified'
+                    ).exists()
+                    
+                    agency_ver = AgencyVerification.objects.filter(agency=agency).first()
+                    is_verified = bool(
+                        (agency.status in [Agency.Status.VERIFIED, Agency.Status.ACTIVE]) or
+                        (agency_ver and agency_ver.status == 'verified')
+                    ) and has_verified_director
+
+            if not is_verified:
                 return {
                     "profile_complete": True,
-                    "tenant_profile_complete": is_tenant_ready,
+                    "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
-                    "next_route": f"/dashboard/{user.role}",
-                    "message": "Welcome to your operational dashboard."
-                }
-            else:
-                return {
-                    "profile_complete": False,
-                    "role": user.role,
-                    "next_route": "/onboarding",
-                    "message": "Please complete your profile to continue."
+                    "next_route": "/pending-verification",
+                    "message": "Your documents are currently under review."
                 }
 
-        tenant_profile_complete = True
-        if user.role in staff_roles:
-            has_dob = bool(profile and profile.date_of_birth)
-            has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
-            tenant_profile_complete = has_dob and has_nok
-
-        # 2. TENANT LOGIC
-        if is_acting_as_tenant:
+        # ==========================================
+        # 3. TENANT LOGIC
+        # ==========================================
+        if user.role == User.Role.TENANT:
             has_active_tenancy = Tenancy.objects.filter(tenant=user, status='active').exists()
             if has_active_tenancy:
                 return {
@@ -313,7 +355,7 @@ class UserService:
                     "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
                     "next_route": "/dashboard/tenant",
-                    "message": "You have an approved application. Proceed to your dashboard to finalize your tenancy."
+                    "message": "You have an approved application."
                 }
 
             has_pending_application = Application.objects.filter(applicant=user, status__in=['pending', 'under_review']).exists()
@@ -323,7 +365,7 @@ class UserService:
                     "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
                     "next_route": "/applications/pending",
-                    "message": "Your application is currently under review by the property manager."
+                    "message": "Your application is under review."
                 }
 
             incomplete_app = Application.objects.filter(applicant=user, status='incomplete').first()
@@ -332,7 +374,7 @@ class UserService:
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
                     "role": user.role,
-                    "next_route": "/marketplace", 
+                    "next_route": "/applications/wizard", 
                     "message": "Resume your incomplete rental application."
                 }
                 
@@ -341,93 +383,24 @@ class UserService:
                 "tenant_profile_complete": tenant_profile_complete,
                 "role": user.role,
                 "next_route": "/marketplace",
-                "message": "You have no active tenancies. Browse available properties."
+                "message": "Browse available properties."
             }
 
-        # 3. LANDLORD & AGENCY LOGIC
+        # ==========================================
+        # 4. LANDLORD & AGENCY LOGIC (PROPERTY CREATION)
+        # ==========================================
         if user.role in [User.Role.LANDLORD, User.Role.AGENCY]:
-            is_verified = False
-            
-            if user.role == User.Role.LANDLORD:
-                verification = getattr(user, 'verification_record', None)
-                if verification and verification.status == 'verified':
-                    is_verified = True
-                    
-            elif user.role == User.Role.AGENCY:
-                try:
-                    Agency = apps.get_model('agencies', 'Agency')
-                    agency = Agency.objects.filter(created_by=user).first()
-                    if not agency:
-                        agency = Agency.objects.filter(contact_email=user.email).first()
-                        
-                    if agency:
-                        if agency.status in [Agency.Status.VERIFIED, Agency.Status.ACTIVE]:
-                            is_verified = True
-                        else:
-                            AgencyVerification = apps.get_model('agencies', 'AgencyVerification')
-                            agency_ver = AgencyVerification.objects.filter(agency=agency).first()
-                            if agency_ver and agency_ver.status == 'verified':
-                                is_verified = True
-                except Exception:
-                    pass
-                
-                if not is_verified:
-                    verification = getattr(user, 'verification_record', None)
-                    if verification and verification.status == 'verified':
-                        is_verified = True
-
-            if user.role == User.Role.LANDLORD:
-                has_dob = bool(profile and profile.date_of_birth)
-                has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
-                tenant_profile_complete = has_dob and has_nok
-            else:
-                tenant_profile_complete = False
-
-            if not is_verified:
-                return {
-                    "profile_complete": True,
-                    "tenant_profile_complete": tenant_profile_complete,
-                    "role": user.role,
-                    "next_route": "/pending-verification",
-                    "message": "Your identity and compliance documents are currently under review."
-                }
-            
             Property = apps.get_model('properties', 'Property')
             
-            if user.role == User.Role.AGENCY:
-                try:
-                    Agency = apps.get_model('agencies', 'Agency')
-                    DelegatedProperty = apps.get_model('agencies', 'DelegatedProperty')
-                    
-                    agency = Agency.objects.filter(created_by=user).first()
-                    if not agency:
-                        agency = Agency.objects.filter(contact_email=user.email).first()
-                        
-                    if agency:
-                        pending_delegations = DelegatedProperty.objects.filter(
-                            agency=agency, 
-                            status__in=['pending', 'pending_acceptance']
-                        ).exists()
-                        
-                        if pending_delegations:
-                            return {
-                                "profile_complete": True,
-                                "tenant_profile_complete": tenant_profile_complete,
-                                "role": user.role,
-                                "next_route": "/dashboard/agency",
-                                "message": "Welcome! You have pending property delegations."
-                            }
-                except Exception:
-                    pass 
-
-            user_properties = Property.objects.filter(created_by=user).annotate(
+            # Check for owned properties
+            owned_properties = Property.objects.filter(created_by=user).annotate(
                 groups_count=Count('unit_groups'),
                 media_count=Count('media')
             ).order_by('-created_at')
             
-            has_completed = any(p.groups_count > 0 or p.media_count > 0 for p in user_properties)
+            has_completed_owned = any(p.groups_count > 0 or p.media_count > 0 for p in owned_properties)
             
-            if has_completed:
+            if has_completed_owned:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
@@ -436,8 +409,8 @@ class UserService:
                     "message": "Welcome back to your management dashboard."
                 }
                 
-            if user_properties.exists():
-                draft_property = user_properties.first()
+            if owned_properties.exists():
+                draft_property = owned_properties.first()
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
@@ -445,22 +418,71 @@ class UserService:
                     "next_route": f"/properties/wizard?property_id={draft_property.id}",
                     "message": "Resume your incomplete property setup."
                 }
+            
+            # If no owned properties, check for delegated properties (Agency only)
+            if user.role == User.Role.AGENCY:
+                Agency = apps.get_model('agencies', 'Agency')
+                DelegatedProperty = apps.get_model('agencies', 'DelegatedProperty')
                 
+                agency = Agency.objects.filter(
+                    Q(created_by=user) | Q(contact_email=user.email)
+                ).first()
+                
+                if agency:
+                    has_delegated = DelegatedProperty.objects.filter(
+                        agency=agency, 
+                        status__in=['active', 'pending', 'pending_acceptance']
+                    ).exists()
+                    
+                    if has_delegated:
+                        return {
+                            "profile_complete": True,
+                            "tenant_profile_complete": tenant_profile_complete,
+                            "role": user.role,
+                            "next_route": "/dashboard/agency",
+                            "message": "Welcome! You have delegated properties to manage."
+                        }
+            
+            # If no properties at all, send to property wizard
             return {
                 "profile_complete": True,
                 "tenant_profile_complete": tenant_profile_complete,
                 "role": user.role,
                 "next_route": "/properties/wizard",
-                "message": "Your account is verified! Get started by creating your first property."
+                "message": "Get started by creating your first property."
             }
 
-        # 4. STAFF FALLBACK
+        # ==========================================
+        # 5. STAFF FALLBACK
+        # ==========================================
+        if user.role in staff_roles:
+            return {
+                "profile_complete": True,
+                "tenant_profile_complete": tenant_profile_complete,
+                "role": user.role,
+                "next_route": f"/dashboard/{user.role}",
+                "message": "Welcome to your operational dashboard."
+            }
+
+        # ==========================================
+        # 6. ADMIN FALLBACK
+        # ==========================================
+        if user.role == User.Role.ADMIN:
+            return {
+                "profile_complete": True,
+                "tenant_profile_complete": True,
+                "role": user.role,
+                "next_route": "/dashboard/admin",
+                "message": "Welcome to the system administration dashboard."
+            }
+
+        # Default fallback
         return {
             "profile_complete": True,
-            "tenant_profile_complete": tenant_profile_complete,
+            "tenant_profile_complete": True,
             "role": user.role,
-            "next_route": f"/dashboard/{user.role}",
-            "message": "Welcome to your operational dashboard."
+            "next_route": "/dashboard",
+            "message": "Welcome to your dashboard."
         }
 
     @staticmethod

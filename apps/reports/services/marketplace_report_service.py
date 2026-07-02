@@ -3,8 +3,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from ..models import Report, ReportSnapshot
-# Assuming MarketplaceAggregator exists based on the aggregator structure
-# from ..aggregators import MarketplaceAggregator 
+from ..aggregators import MarketplaceAggregator
 from ..exporters.excel_exporter import ExcelExporter
 
 logger = logging.getLogger(__name__)
@@ -17,9 +16,6 @@ class MarketplaceReportService:
     @staticmethod
     @transaction.atomic
     def initiate_marketplace_report(user, title: str, parameters: dict) -> Report:
-        """
-        Creates a Report record and triggers background processing for marketplace data.
-        """
         report = Report.objects.create(
             title=title,
             report_type=Report.ReportType.MARKETPLACE,
@@ -33,9 +29,6 @@ class MarketplaceReportService:
 
     @staticmethod
     def _process_report(report_id: int):
-        """
-        Core processing logic for the marketplace report.
-        """
         try:
             report = Report.objects.select_related('generated_by').get(id=report_id)
             report.status = Report.Status.PROCESSING
@@ -45,18 +38,17 @@ class MarketplaceReportService:
             params = report.parameters
             days = params.get('days', 30)
 
-            # 1. Aggregate Data (Placeholder structure matching aggregator pattern)
-            # marketplace_summary = MarketplaceAggregator.get_lead_summary(user, days=days)
-            # listing_performance = MarketplaceAggregator.get_listing_performance(user, days=days)
+            # 1. Aggregate Data (Wired to real MarketplaceAggregator)
+            marketplace_summary = MarketplaceAggregator.get_marketplace_summary(user, days=days)
+            top_performing_units = MarketplaceAggregator.get_top_performing_listings(user, limit=5)
             
-            # Simulated payload for structural completeness
             snapshot_payload = {
                 "generated_at": timezone.now().isoformat(),
                 "period_days": days,
-                "total_listing_views": 0,
-                "total_inquiries": 0,
-                "conversion_rate": 0.0,
-                "top_performing_units": []
+                "total_listing_views": marketplace_summary.get("total_views", 0),
+                "total_inquiries": marketplace_summary.get("total_saved", 0), # Saved listings act as inquiries
+                "conversion_rate": marketplace_summary.get("conversion_rate", 0.0),
+                "top_performing_units": top_performing_units
             }
 
             # 2. Save Immutable Snapshot
@@ -65,7 +57,7 @@ class MarketplaceReportService:
                 snapshot_data=snapshot_payload
             )
 
-            # 3. Generate Export (Excel for detailed lead tracking)
+            # 3. Generate Export
             filename = f"marketplace_report_{report.id}_{timezone.now().strftime('%Y%m%d')}.xlsx"
             export_result = ExcelExporter.generate_excel_from_data(
                 snapshot_payload,

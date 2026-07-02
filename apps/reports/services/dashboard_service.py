@@ -2,8 +2,10 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from ..models import Dashboard, DashboardWidget, DashboardSnapshot
-from ..aggregators import PaymentAggregator, TenancyAggregator, PropertyAggregator, MaintenanceAggregator, ApplicationAggregator
-from ..utils.filters import ReportFilterUtils
+from ..aggregators import (
+    PaymentAggregator, TenancyAggregator, PropertyAggregator, 
+    MaintenanceAggregator, ApplicationAggregator, MarketplaceAggregator
+)
 
 class DashboardService:
     """
@@ -11,15 +13,31 @@ class DashboardService:
     Maps widget data sources to the appropriate aggregator methods.
     """
 
-    # Mapping of data_source strings to actual aggregator methods
+    # ✅ EXPANDED: Mapping of all data_source strings to actual aggregator methods
     AGGREGATOR_MAP = {
+        # Financial
         'payment_aggregator.get_financial_summary': PaymentAggregator.get_financial_summary,
+        'payment_aggregator.get_landlord_statements': PaymentAggregator.get_landlord_statements,
+        
+        # Tenancy
         'tenancy_aggregator.get_occupancy_summary': TenancyAggregator.get_occupancy_summary,
         'tenancy_aggregator.get_upcoming_expiries': TenancyAggregator.get_upcoming_expiries,
+        
+        # Property
         'property_aggregator.get_portfolio_summary': PropertyAggregator.get_portfolio_summary,
         'property_aggregator.get_unit_type_distribution': PropertyAggregator.get_unit_type_distribution,
+        'property_aggregator.get_portfolio_metrics': PropertyAggregator.get_portfolio_metrics,
+        
+        # Maintenance
         'maintenance_aggregator.get_maintenance_summary': MaintenanceAggregator.get_maintenance_summary,
+        'maintenance_aggregator.get_maintenance_analytics': MaintenanceAggregator.get_maintenance_analytics,
+        
+        # Applications
         'application_aggregator.get_application_pipeline_summary': ApplicationAggregator.get_application_pipeline_summary,
+        
+        # Marketplace
+        'marketplace_aggregator.get_marketplace_summary': MarketplaceAggregator.get_marketplace_summary,
+        'marketplace_aggregator.get_top_performing_listings': MarketplaceAggregator.get_top_performing_listings,
     }
 
     @staticmethod
@@ -54,7 +72,7 @@ class DashboardService:
                     # Pass user to ensure strict data scoping
                     computed_data = aggregator_func(user)
                 else:
-                    computed_data = {"error": "Unknown data source"}
+                    computed_data = {"error": f"Unknown data source: {data_source}"}
 
                 widget_data.append({
                     "widget_id": widget_model.id,

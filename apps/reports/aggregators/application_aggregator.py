@@ -1,8 +1,9 @@
 from django.db.models import Count, Q
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 from datetime import timedelta
+from django.apps import apps
 
-from apps.applications.models import Application
 from apps.reports.utils.filters import ReportFilterUtils
 from apps.reports.utils.calculations import CalculationUtils
 
@@ -16,7 +17,8 @@ class ApplicationAggregator:
         """
         Returns counts of pending, approved, and rejected applications scoped to the user's properties.
         """
-        from properties.models import Property
+        Property = apps.get_model('properties', 'Property')
+        Application = apps.get_model('applications', 'Application')
         
         accessible_properties = ReportFilterUtils.scope_properties_by_user(user, Property.objects.all())
         property_ids = accessible_properties.values_list('id', flat=True)
@@ -49,12 +51,28 @@ class ApplicationAggregator:
         """
         Returns daily application submission counts for the last N days for charting.
         """
+        Property = apps.get_model('properties', 'Property')
+        Application = apps.get_model('applications', 'Application')
+        
+        accessible_properties = ReportFilterUtils.scope_properties_by_user(user, Property.objects.all())
+        property_ids = accessible_properties.values_list('id', flat=True)
+        
+        if not property_ids:
+            return {"labels": [], "data": []}
+
         cutoff_date = timezone.now() - timedelta(days=days)
         
-        # Placeholder: In production, use Django's TruncDate to group by day
-        # trend = Application.objects.filter(
-        #     created_at__gte=cutoff_date,
-        #     property_id__in=property_ids
-        # ).annotate(date=TruncDate('created_at')).values('date').annotate(count=Count('id')).order_by('date')
+        # ✅ REAL IMPLEMENTATION: Group by date using TruncDate
+        trend_data = Application.objects.filter(
+            property_id__in=property_ids,
+            created_at__gte=cutoff_date
+        ).annotate(
+            date=TruncDate('created_at')
+        ).values('date').annotate(
+            count=Count('id')
+        ).order_by('date')
         
-        return {"labels": [], "data": []}
+        labels = [item['date'].strftime('%Y-%m-%d') for item in trend_data]
+        data = [item['count'] for item in trend_data]
+        
+        return {"labels": labels, "data": data}

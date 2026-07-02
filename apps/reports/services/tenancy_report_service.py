@@ -16,9 +16,6 @@ class TenancyReportService:
     @staticmethod
     @transaction.atomic
     def initiate_tenancy_report(user, title: str, parameters: dict) -> Report:
-        """
-        Creates a Report record and triggers background processing for tenancy data.
-        """
         report = Report.objects.create(
             title=title,
             report_type=Report.ReportType.TENANCY,
@@ -27,15 +24,11 @@ class TenancyReportService:
             status=Report.Status.PENDING
         )
         
-        # In production: TenancyReportService._process_report_task.delay(report.id)
         TenancyReportService._process_report(report.id)
         return report
 
     @staticmethod
     def _process_report(report_id: int):
-        """
-        Core processing logic for the tenancy report.
-        """
         try:
             report = Report.objects.select_related('generated_by').get(id=report_id)
             report.status = Report.Status.PROCESSING
@@ -62,7 +55,7 @@ class TenancyReportService:
                 snapshot_data=snapshot_payload
             )
 
-            # 3. Generate Export (Excel is ideal for tabular tenant lists)
+            # 3. Generate Export
             filename = f"tenancy_report_{report.id}_{timezone.now().strftime('%Y%m%d')}.xlsx"
             export_result = ExcelExporter.generate_excel_from_data(
                 snapshot_payload,

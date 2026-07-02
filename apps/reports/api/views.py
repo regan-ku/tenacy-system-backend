@@ -2,6 +2,8 @@ from rest_framework import viewsets, status, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResponse
+from django.http import FileResponse
+import io
 
 from ..models import Report, ReportSchedule, Dashboard
 from ..permissions.reports_permissions import (
@@ -19,6 +21,9 @@ from ..dashboards.builders import (
     CaretakerDashboardBuilder,
     TenantDashboardBuilder
 )
+
+# ✅ NEW: Import the aggregators for the Agency Intelligence endpoints
+from ..aggregators import PropertyAggregator, MaintenanceAggregator, PaymentAggregator
 
 DASHBOARD_BUILDERS = {
     'admin': AdminDashboardBuilder,
@@ -82,12 +87,54 @@ class ReportViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(generated_by=self.request.user)
 
+    # ==========================================
+    # ✅ NEW: AGENCY INTELLIGENCE ENDPOINTS
+    # ==========================================
+
+    @extend_schema(summary="Get Portfolio Metrics")
+    @action(detail=False, methods=['GET'], url_path='portfolio-metrics', permission_classes=[CanViewDashboard])
+    def portfolio_metrics(self, request):
+        """Returns per-property metrics: occupancy, rent collected, arrears, open maintenance."""
+        data = PropertyAggregator.get_portfolio_metrics(request.user)
+        return Response(data, status=status.HTTP_200_OK)
+
+    @extend_schema(summary="Get Maintenance Analytics")
+    @action(detail=False, methods=['GET'], url_path='maintenance-analytics', permission_classes=[CanViewDashboard])
+    def maintenance_analytics(self, request):
+        """Returns SLA compliance and resolution times based on priority rules."""
+        data = MaintenanceAggregator.get_maintenance_analytics(request.user)
+        return Response(data, status=status.HTTP_200_OK)
+
+    @extend_schema(summary="Get Landlord Statements")
+    @action(detail=False, methods=['GET'], url_path='landlord-statements', permission_classes=[CanViewDashboard])
+    def landlord_statements(self, request):
+        """Generates monthly financial statements for landlords whose properties are managed by the user."""
+        data = PaymentAggregator.get_landlord_statements(request.user)
+        return Response(data, status=status.HTTP_200_OK)
+
+    # ==========================================
+    # ✅ NEW: PDF EXPORT
+    # ==========================================
+
+    @extend_schema(summary="Export Statement PDF")
+    @action(detail=False, methods=['GET'], url_path='statements/(?P<statement_id>[^/.]+)/export/pdf', permission_classes=[CanExportData])
+    def export_statement_pdf(self, request, statement_id=None):
+        """
+        Generates and returns a PDF for a specific landlord statement.
+        """
+        # Placeholder: Create a dummy PDF in memory to trigger browser download
+        buffer = io.BytesIO()
+        buffer.write(b"%PDF-1.4\n% Dummy PDF Content for Statement " + statement_id.encode() + b"\n")
+        buffer.seek(0)
+        
+        return FileResponse(buffer, as_attachment=True, filename=f"statement-{statement_id}.pdf")
+
     @extend_schema(
         summary="Download Report Export",
         description="Redirects to or serves the generated PDF/Excel file for a completed report.",
         responses={
             200: OpenApiResponse(description="File download initiated"), 
-            404: OpenApiResponse(description="Report not found or not completed") # ✅ FIX: Explicit OpenApiResponse
+            404: OpenApiResponse(description="Report not found or not completed")
         }
     )
     @action(detail=True, methods=['GET'], permission_classes=[CanExportData])

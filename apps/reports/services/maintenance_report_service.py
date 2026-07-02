@@ -63,12 +63,12 @@ class MaintenanceReportService:
                 snapshot_data=snapshot_payload
             )
 
-            # 3. Generate Export (PDF for formal operational reporting)
+            # 3. Generate Export using DocumentTemplate system
             filename = f"maintenance_report_{report.id}_{timezone.now().strftime('%Y%m%d')}.pdf"
-            export_result = PDFExporter.generate_pdf_from_template(
-                "reports/maintenance_report.html",
-                {"data": snapshot_payload, "user": user.email},
-                filename
+            export_result = PDFExporter.generate_pdf_from_document_template(
+                document_type_code="maintenance_report",
+                variables={"data": snapshot_payload, "user": user.email},
+                filename=filename
             )
 
             if export_result["success"]:

@@ -103,6 +103,7 @@ class PropertySerializer(serializers.ModelSerializer):
     def get_total_units(self, obj):
         return getattr(obj, 'total_units_count', obj.units.count())
 
+    # ✅ FIXED: Calculate occupancy based on ACTIVE TENANCIES, not Unit.status column
     def get_occupancy_rate(self, obj):
         total_units = getattr(obj, 'total_units_count', obj.units.count())
         if total_units == 0:
@@ -163,6 +164,7 @@ class UnitGroupSerializer(serializers.ModelSerializer):
     def get_actual_units_count(self, obj):
         return getattr(obj, 'actual_units_count', obj.units.count())
 
+    # ✅ FIXED: Calculate occupied units based on ACTIVE TENANCIES, not Unit.status column
     def get_occupied_units(self, obj):
         return getattr(obj, 'occupied_units_count', obj.units.filter(
             tenancies__status__in=['active', 'extended', 'pending_payment']

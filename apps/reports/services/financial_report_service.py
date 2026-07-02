@@ -5,7 +5,7 @@ from django.utils import timezone
 from ..models import Report, ReportSnapshot
 from ..aggregators import PaymentAggregator, PropertyAggregator
 from ..utils.date_helpers import DateHelperUtils
-from ..exporters.pdf_exporter import PDFExporter # Assuming this exists
+from ..exporters.pdf_exporter import PDFExporter
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ class FinancialReportService:
     def initiate_financial_report(user, title: str, parameters: dict) -> Report:
         """
         Creates a Report record in PENDING status and triggers background processing.
-        In production, this would dispatch a Celery task. Here we process synchronously for structure.
+        In production, this would dispatch a Celery task.
         """
         report = Report.objects.create(
             title=title,
@@ -30,7 +30,6 @@ class FinancialReportService:
             status=Report.Status.PENDING
         )
         
-        # Dispatch to Celery in production: generate_financial_report_task.delay(report.id)
         FinancialReportService._process_report(report.id)
         
         return report
@@ -73,12 +72,12 @@ class FinancialReportService:
                 snapshot_data=snapshot_payload
             )
 
-            # 4. Generate Export (Simulated)
+            # 4. Generate Export using DocumentTemplate system
             filename = f"financial_report_{report.id}_{timezone.now().strftime('%Y%m%d')}.pdf"
-            export_result = PDFExporter.generate_pdf_from_template(
-                "reports/financial_report.html", # Template path
-                {"data": snapshot_payload, "user": user.email},
-                filename
+            export_result = PDFExporter.generate_pdf_from_document_template(
+                document_type_code="financial_report",
+                variables={"data": snapshot_payload, "user": user.email},
+                filename=filename
             )
 
             if export_result["success"]:
