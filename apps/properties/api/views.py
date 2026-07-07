@@ -100,7 +100,6 @@ class PropertyViewSet(viewsets.ModelViewSet):
 
         # ==========================================
         # 🚀 PERFORMANCE FIX: ANNOTATE COUNTS TO PREVENT N+1 QUERIES
-        # ✅ FIXED: Calculate occupancy based on ACTIVE TENANCIES, not Unit.status column
         # ==========================================
         qs = qs.annotate(
             total_units_count=Count('units', distinct=True),
@@ -238,7 +237,13 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if not groups_data:
             return Response({"error": "No unit groups provided."}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            created_groups = UnitGroupService.finalize_property_unit_groups(property_obj=property_obj, user=request.user, groups_data=groups_data)
+            # ✅ FIX: Changed property_obj=property_obj to property=property_obj 
+            # to match the expected keyword argument in UnitGroupService
+            created_groups = UnitGroupService.finalize_property_unit_groups(
+                property=property_obj, 
+                user=request.user, 
+                groups_data=groups_data
+            )
             serializer = prop_serializers.UnitGroupSerializer(created_groups, many=True)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         except Exception as e:
@@ -297,7 +302,6 @@ class UnitGroupViewSet(viewsets.ModelViewSet):
         property_pk = self.kwargs.get('property_pk')
         
         # 🚀 PERFORMANCE FIX: Annotate counts to prevent N+1 queries in UnitGroupSerializer
-        # ✅ FIXED: Calculate occupancy based on ACTIVE TENANCIES, not Unit.status column
         return UnitGroup.objects.filter(property_id=property_pk).annotate(
             actual_units_count=Count('units', distinct=True),
             occupied_units_count=Count(
@@ -331,7 +335,6 @@ class UnitViewSet(viewsets.ModelViewSet):
         if getattr(self, 'swagger_fake_view', False): return Unit.objects.none()
         property_pk = self.kwargs.get('property_pk')
         
-        # ✅ UPDATED: Removed tenancy subquery. We now rely purely on the Unit model's status field.
         return Unit.objects.filter(property_ref_id=property_pk).select_related('property_ref', 'unit_group')
 
     def get_serializer_context(self):

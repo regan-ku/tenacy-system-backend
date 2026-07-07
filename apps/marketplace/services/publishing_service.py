@@ -1,12 +1,13 @@
 from django.db import transaction
 from django.db.models import Min
 from django.core.exceptions import ValidationError
-from ..models import PropertyPublication, Listing
+from django.utils import timezone
+from ..models import PropertyPublication, Listing, MarketplaceVisibilityLog
 
 class PublishingService:
     """
-    Handles the actual publishing and unpublishing of properties to the marketplace.
-    Creates the necessary Publication and Listing records.
+    Handles the actual publishing, hiding, and unpublishing of properties to the marketplace.
+    Creates the necessary Publication and Listing records, and logs all actions.
     """
 
     @staticmethod
@@ -14,8 +15,6 @@ class PublishingService:
     def publish_property(property, user):
         """
         Publishes a property to the marketplace.
-        1. Creates/Updates the PropertyPublication record.
-        2. Generates Listing records for the property and its unit groups.
         """
         if not property.is_active:
             raise ValidationError("Cannot publish an inactive property.")
@@ -26,17 +25,106 @@ class PublishingService:
             defaults={
                 'is_published': True,
                 'visibility_status': 'visible',
-                'published_by': user
+                'published_by': user,
+                'last_modified_by': user
             }
         )
         
         if not created:
             publication.is_published = True
             publication.visibility_status = 'visible'
+            publication.published_at = timezone.now()
+            publication.unpublished_at = None
             publication.last_modified_by = user
-            publication.save(update_fields=['is_published', 'visibility_status', 'last_modified_by'])
+            publication.save(update_fields=[
+                'is_published', 'visibility_status', 'published_at', 
+                'unpublished_at', 'last_modified_by', 'updated_at'
+            ])
 
         # 2. Generate Marketplace Listings
+        PublishingService._generate_listings(property)
+
+        # 3. Audit Log
+        # ✅ FIX 1: Changed 'notes' to 'reason'
+        # ✅ FIX 2: Added the required 'publication' object
+        MarketplaceVisibilityLog.objects.create(
+            property=property,
+            publication=publication,
+            action='published',
+            performed_by=user,
+            reason='Property published to marketplace.'
+        )
+            
+        print(f"✅ Property '{property.title}' successfully published to marketplace.")
+
+    @staticmethod
+    @transaction.atomic
+    def hide_property(property, user):
+        """
+        Temporarily hides a property from the marketplace without deleting listings.
+        """
+        # Fetch publication before updating to use in the audit log
+        publication = PropertyPublication.objects.filter(property=property).first()
+
+        PropertyPublication.objects.filter(property=property).update(
+            is_published=False,
+            visibility_status='hidden',
+            last_modified_by=user,
+            unpublished_at=timezone.now()
+        )
+        
+        # Hide listings but keep them in database for quick restoration
+        Listing.objects.filter(property=property).update(status='hidden')
+
+        # Audit Log
+        if publication:
+            MarketplaceVisibilityLog.objects.create(
+                property=property,
+                publication=publication,
+                action='hidden',
+                performed_by=user,
+                reason='Property temporarily hidden from marketplace.'
+            )
+
+        print(f"✅ Property '{property.title}' successfully hidden from marketplace.")
+
+    @staticmethod
+    @transaction.atomic
+    def unpublish_property(property, user=None):
+        """
+        Completely removes a property from the marketplace and deletes all listings.
+        """
+        # Fetch publication before updating to use in the audit log
+        publication = PropertyPublication.objects.filter(property=property).first()
+
+        PropertyPublication.objects.filter(property=property).update(
+            is_published=False,
+            visibility_status='unpublished',
+            last_modified_by=user,
+            unpublished_at=timezone.now()
+        )
+        
+        # Delete all listings entirely
+        Listing.objects.filter(property=property).delete()
+
+        # Audit Log
+        if publication and user:
+            MarketplaceVisibilityLog.objects.create(
+                property=property,
+                publication=publication,
+                action='unpublished',
+                performed_by=user,
+                reason='Property permanently unpublished from marketplace.'
+            )
+
+        print(f"✅ Property '{property.title}' successfully unpublished from marketplace.")
+
+    @staticmethod
+    def _generate_listings(property):
+        """
+        Internal helper to generate marketplace listings for a property.
+        Clears old listings first to prevent duplicates.
+        """
         # Clear old listings to prevent duplicates
         Listing.objects.filter(property=property).delete()
         
@@ -50,7 +138,7 @@ class PublishingService:
             listing_type=listing_type,
             title=property.title,
             min_rent_amount=min_rent,
-            price_period='per month' if listing_type == 'rental' else '',
+            price_period='per month' if listing_type == 'rental' else 'per night' if listing_type == 'short_stay' else '',
             status='active'
         )
         
@@ -65,20 +153,3 @@ class PublishingService:
                 price_period=f'per {group.billing_cycle}',
                 status='active'
             )
-            
-        print(f"✅ Property '{property.title}' successfully published to marketplace.")
-
-    @staticmethod
-    @transaction.atomic
-    def unpublish_property(property):
-        """
-        Unpublishes a property, hiding it from the public marketplace.
-        """
-        PropertyPublication.objects.filter(property=property).update(
-            is_published=False, 
-            visibility_status='hidden'
-        )
-        
-        # Hide all associated listings
-        Listing.objects.filter(property=property).update(status='hidden')
-        print(f"✅ Property '{property.title}' successfully unpublished from marketplace.")

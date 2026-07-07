@@ -3,10 +3,6 @@ from django.conf import settings
 from django.utils import timezone
 
 class PropertyPublication(models.Model):
-    """
-    Master switch controlling whether a property is exposed to the public marketplace.
-    Visibility is strictly independent from internal operational management.
-    """
     class VisibilityStatus(models.TextChoices):
         VISIBLE = 'visible', 'Visible on Marketplace'
         HIDDEN = 'hidden', 'Hidden (Internal Only)'
@@ -60,6 +56,29 @@ class PropertyPublication(models.Model):
     def __str__(self):
         status = "Published" if self.is_published else "Unpublished"
         return f"{self.property.title} - {status}"
+
+    def save(self, *args, **kwargs):
+        # ✅ CRITICAL FIX: Auto-sync visibility_status when is_published changes.
+        # This ensures the Django Admin checkbox actually triggers marketplace visibility.
+        if self.pk:
+            try:
+                previous = PropertyPublication.objects.get(pk=self.pk)
+                prev_published = previous.is_published
+            except PropertyPublication.DoesNotExist:
+                prev_published = False
+        else:
+            prev_published = False
+
+        if self.is_published and not prev_published:
+            self.visibility_status = self.VisibilityStatus.VISIBLE
+            self.published_at = timezone.now()
+            self.unpublished_at = None
+        elif not self.is_published and prev_published:
+            if self.visibility_status == self.VisibilityStatus.VISIBLE:
+                self.visibility_status = self.VisibilityStatus.HIDDEN
+            self.unpublished_at = timezone.now()
+
+        super().save(*args, **kwargs)
 
     def publish(self, user):
         self.is_published = True

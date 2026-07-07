@@ -1,6 +1,7 @@
 from django.db import transaction
 from django.utils import timezone
 from django.core.exceptions import ValidationError
+from django.db.models import Q
 from ..models import FeaturedListing, Listing
 
 class FeaturedListingService:
@@ -14,7 +15,7 @@ class FeaturedListingService:
         """
         Promotes a listing to a featured placement for a specified duration.
         """
-        if not listing.status == 'active':
+        if listing.status != 'active':
             raise ValidationError("Cannot feature an inactive or unavailable listing.")
 
         end_date = timezone.now() + timezone.timedelta(days=duration_days)
@@ -47,17 +48,11 @@ class FeaturedListingService:
     def get_active_featured_listings(placement: str = None, limit: int = 10):
         """
         Retrieves currently active featured listings for homepage or category displays.
+        ✅ FIXED: Properly uses Q objects for nullable end_date handling.
         """
         now = timezone.now()
-        filters = {
-            'is_active': True,
-            'start_date__lte': now,
-        }
-        # Handle nullable end_date (indefinite) or future end_date
-        from django.db.models import Q
-        filters['end_date__gte'] = now
-        filters['end_date__isnull'] = True # Or use Q(end_date__gte=now) | Q(end_date__isnull=True)
         
+        # ✅ FIX: Use Q objects properly instead of conflicting dict keys
         queryset = FeaturedListing.objects.filter(
             Q(end_date__gte=now) | Q(end_date__isnull=True),
             is_active=True,

@@ -44,6 +44,23 @@ class PropertySerializer(serializers.ModelSerializer):
     property_sub_type = serializers.ChoiceField(choices=PropertySubType.choices)
     construction_type = serializers.ChoiceField(choices=ConstructionType.choices, required=False)
 
+    # ✅ CRITICAL FIX: Explicitly declare is_published and listing_type as writable fields
+    is_published = serializers.BooleanField(
+        required=False, 
+        default=False,
+        help_text="Publish property to public marketplace"
+    )
+    listing_type = serializers.ChoiceField(
+        choices=[
+            ('rental', 'Rental'),
+            ('sale', 'Sale'),
+            ('short_stay', 'Short Stay')
+        ],
+        required=False,
+        allow_null=True,
+        help_text="Type of listing when published to marketplace"
+    )
+
     landlord_name = serializers.SerializerMethodField()
     delegation_info = serializers.SerializerMethodField()
     delegation_id = serializers.SerializerMethodField()
