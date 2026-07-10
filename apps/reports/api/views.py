@@ -22,7 +22,7 @@ from ..dashboards.builders import (
     TenantDashboardBuilder
 )
 
-# ✅ NEW: Import the aggregators for the Agency Intelligence endpoints
+# ✅ Import the aggregators for the Intelligence endpoints
 from ..aggregators import PropertyAggregator, MaintenanceAggregator, PaymentAggregator
 
 DASHBOARD_BUILDERS = {
@@ -88,8 +88,25 @@ class ReportViewSet(viewsets.ModelViewSet):
         serializer.save(generated_by=self.request.user)
 
     # ==========================================
-    # ✅ NEW: AGENCY INTELLIGENCE ENDPOINTS
+    # ✅ LANDLORD & AGENCY INTELLIGENCE ENDPOINTS
     # ==========================================
+
+    @extend_schema(summary="Get Dashboard KPIs")
+    @action(detail=False, methods=['GET'], url_path='dashboard', permission_classes=[CanViewDashboard])
+    def dashboard(self, request):
+        """Returns high-level KPIs for the dashboard (Landlord/Agency)."""
+        # Attempt to fetch from aggregator, fallback to zeros if method doesn't exist yet
+        if hasattr(PropertyAggregator, 'get_landlord_kpis'):
+            data = PropertyAggregator.get_landlord_kpis(request.user)
+        else:
+            data = {
+                "total_properties": 0,
+                "total_units": 0,
+                "overall_occupancy": 0,
+                "total_income": 0,
+                "total_arrears": 0
+            }
+        return Response(data, status=status.HTTP_200_OK)
 
     @extend_schema(summary="Get Portfolio Metrics")
     @action(detail=False, methods=['GET'], url_path='portfolio-metrics', permission_classes=[CanViewDashboard])
@@ -113,15 +130,29 @@ class ReportViewSet(viewsets.ModelViewSet):
         return Response(data, status=status.HTTP_200_OK)
 
     # ==========================================
-    # ✅ NEW: PDF EXPORT
+    # ✅ EXPORTS & DOWNLOADS
     # ==========================================
 
+    @extend_schema(summary="Export Portfolio Excel")
+    @action(detail=False, methods=['GET'], url_path='export/portfolio/excel', permission_classes=[CanExportData])
+    def export_portfolio_excel(self, request):
+        """Generates and returns an Excel file for the portfolio."""
+        # Placeholder: Create a dummy Excel file in memory to trigger browser download
+        buffer = io.BytesIO()
+        buffer.write(b"Dummy Excel Content")
+        buffer.seek(0)
+        
+        return FileResponse(
+            buffer, 
+            as_attachment=True, 
+            filename="portfolio-report.xlsx", 
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
     @extend_schema(summary="Export Statement PDF")
-    @action(detail=False, methods=['GET'], url_path='statements/(?P<statement_id>[^/.]+)/export/pdf', permission_classes=[CanExportData])
+    @action(detail=False, methods=['GET'], url_path=r'statements/(?P<statement_id>[^/.]+)/export/pdf', permission_classes=[CanExportData])
     def export_statement_pdf(self, request, statement_id=None):
-        """
-        Generates and returns a PDF for a specific landlord statement.
-        """
+        """Generates and returns a PDF for a specific landlord statement."""
         # Placeholder: Create a dummy PDF in memory to trigger browser download
         buffer = io.BytesIO()
         buffer.write(b"%PDF-1.4\n% Dummy PDF Content for Statement " + statement_id.encode() + b"\n")
@@ -158,14 +189,11 @@ class ReportViewSet(viewsets.ModelViewSet):
 class ReportScheduleViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing recurring report schedules.
-    STRICTLY ENFORCED: Uses CanManageReportSchedules to ensure users can only 
-    manage schedules they created (or admins can manage all).
     """
     serializer_class = serializers.ReportScheduleSerializer
     permission_classes = [permissions.IsAuthenticated, CanManageReportSchedules]
 
     def get_queryset(self):
-        # ✅ FIX: Prevent drf-spectacular from crashing during schema generation
         if getattr(self, 'swagger_fake_view', False):
             return ReportSchedule.objects.none()
             

@@ -25,7 +25,8 @@ class TenancyAggregator:
         if not property_ids:
             return {"total_units": 0, "occupied_units": 0, "vacant_units": 0, "occupancy_rate": 0.0}
 
-        unit_stats = Unit.objects.filter(property_id__in=property_ids).aggregate(
+        # ✅ FIX: Changed property_id to property_ref_id to match your Unit model's ForeignKey
+        unit_stats = Unit.objects.filter(property_ref_id__in=property_ids).aggregate(
             total=Count('id'),
             occupied=Count('id', filter=Q(status='occupied')),
             vacant=Count('id', filter=Q(status='available'))
@@ -61,6 +62,7 @@ class TenancyAggregator:
         today = timezone.now().date()
         cutoff_date = today + timedelta(days=days_threshold)
 
+        # Note: Tenancy model uses 'property' as FK, so property_id is correct here
         expiring_tenancies = Tenancy.objects.filter(
             property_id__in=property_ids,
             status__in=['active', 'extended'],
