@@ -163,7 +163,6 @@ class UserService:
 
         temp_password = f"Temp{secrets.token_urlsafe(8)}!"
 
-        # Map frontend roles to valid User.Role choices
         user_role_map = {
             'agent': User.Role.AGENT,
             'caretaker': User.Role.CARETAKER,
@@ -224,17 +223,13 @@ class UserService:
         POST-LOGIN USER STATE RESOLUTION ENGINE
         Determines the exact next_route based on profile, records, and verification.
         """
-        profile = getattr(user, 'profile', None)
+        # ✅ CRITICAL FIX: Explicitly query the DB for the profile to prevent Django from 
+        # using a stale cached instance of the reverse OneToOne relation.
+        profile = Profile.objects.filter(user=user).first()
         
         Application = apps.get_model('applications', 'Application')
         Tenancy = apps.get_model('tenancy', 'Tenancy')
         
-        is_acting_as_tenant = (
-            user.role == User.Role.TENANT or
-            Application.objects.filter(applicant=user).exists() or
-            Tenancy.objects.filter(tenant=user, status='active').exists()
-        )
-
         staff_roles = [User.Role.AGENT, User.Role.CARETAKER]
         if hasattr(User.Role, 'PROPERTY_MANAGER'):
             staff_roles.append(User.Role.PROPERTY_MANAGER)
@@ -245,7 +240,6 @@ class UserService:
         is_profile_complete = False
         tenant_profile_complete = False # DOB + NOK (Required for renting)
         
-        # ✅ FIX: Admins bypass standard profile checks and go straight to the dashboard
         if user.role == User.Role.ADMIN:
             is_profile_complete = True
             tenant_profile_complete = True
@@ -265,31 +259,26 @@ class UserService:
                 tenant_profile_complete = has_dob and has_nok
 
         elif user.role == User.Role.AGENCY:
-            # Agencies bypass personal User.Profile. They need Business Profile + Director + Verification
             Agency = apps.get_model('agencies', 'Agency')
             agency = Agency.objects.filter(
                 Q(created_by=user) | Q(contact_email=user.email)
             ).first()
-            
-            # If they have an agency record, we consider their business profile complete.
             is_profile_complete = bool(agency)
-            tenant_profile_complete = False # Agencies don't rent as individuals
+            tenant_profile_complete = False 
 
         elif user.role in staff_roles:
-            # Staff have a ghost profile. They are "operationally complete" if they have basic info.
             has_basic_profile = profile and profile.full_name and user.phone_number
             is_profile_complete = bool(has_basic_profile)
-            
             if is_profile_complete:
                 has_dob = bool(profile and profile.date_of_birth)
                 has_nok = NextOfKin.objects.filter(user=user, is_primary=True).exists()
                 tenant_profile_complete = has_dob and has_nok
 
-        # If profile is NOT complete, send to onboarding
         if not is_profile_complete:
             return {
                 "profile_complete": False,
                 "tenant_profile_complete": False,
+                "can_apply": False,
                 "role": user.role,
                 "next_route": "/onboarding",
                 "message": "Please complete your profile to continue."
@@ -329,6 +318,7 @@ class UserService:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": False,
                     "role": user.role,
                     "next_route": "/pending-verification",
                     "message": "Your documents are currently under review."
@@ -339,10 +329,14 @@ class UserService:
         # ==========================================
         if user.role == User.Role.TENANT:
             has_active_tenancy = Tenancy.objects.filter(tenant=user, status='active').exists()
+            
+            can_apply = tenant_profile_complete and not has_active_tenancy
+
             if has_active_tenancy:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": False,
                     "role": user.role,
                     "next_route": "/dashboard/tenant",
                     "message": "Welcome back to your tenant dashboard."
@@ -353,6 +347,7 @@ class UserService:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": False,
                     "role": user.role,
                     "next_route": "/dashboard/tenant",
                     "message": "You have an approved application."
@@ -363,6 +358,7 @@ class UserService:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": False,
                     "role": user.role,
                     "next_route": "/applications/pending",
                     "message": "Your application is under review."
@@ -373,6 +369,7 @@ class UserService:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": True,
                     "role": user.role,
                     "next_route": "/applications/wizard", 
                     "message": "Resume your incomplete rental application."
@@ -381,18 +378,18 @@ class UserService:
             return {
                 "profile_complete": True,
                 "tenant_profile_complete": tenant_profile_complete,
+                "can_apply": can_apply,
                 "role": user.role,
                 "next_route": "/marketplace",
                 "message": "Browse available properties."
             }
 
         # ==========================================
-        # 4. LANDLORD & AGENCY LOGIC (PROPERTY CREATION)
+        # 4. LANDLORD & AGENCY LOGIC
         # ==========================================
         if user.role in [User.Role.LANDLORD, User.Role.AGENCY]:
             Property = apps.get_model('properties', 'Property')
             
-            # Check for owned properties
             owned_properties = Property.objects.filter(created_by=user).annotate(
                 groups_count=Count('unit_groups'),
                 media_count=Count('media')
@@ -404,6 +401,7 @@ class UserService:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": False,
                     "role": user.role,
                     "next_route": f"/dashboard/{user.role}",
                     "message": "Welcome back to your management dashboard."
@@ -414,12 +412,12 @@ class UserService:
                 return {
                     "profile_complete": True,
                     "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": False,
                     "role": user.role,
                     "next_route": f"/properties/wizard?property_id={draft_property.id}",
                     "message": "Resume your incomplete property setup."
                 }
             
-            # If no owned properties, check for delegated properties (Agency only)
             if user.role == User.Role.AGENCY:
                 Agency = apps.get_model('agencies', 'Agency')
                 DelegatedProperty = apps.get_model('agencies', 'DelegatedProperty')
@@ -438,15 +436,16 @@ class UserService:
                         return {
                             "profile_complete": True,
                             "tenant_profile_complete": tenant_profile_complete,
+                            "can_apply": False,
                             "role": user.role,
                             "next_route": "/dashboard/agency",
                             "message": "Welcome! You have delegated properties to manage."
                         }
             
-            # If no properties at all, send to property wizard
             return {
                 "profile_complete": True,
                 "tenant_profile_complete": tenant_profile_complete,
+                "can_apply": False,
                 "role": user.role,
                 "next_route": "/properties/wizard",
                 "message": "Get started by creating your first property."
@@ -459,6 +458,7 @@ class UserService:
             return {
                 "profile_complete": True,
                 "tenant_profile_complete": tenant_profile_complete,
+                "can_apply": tenant_profile_complete,
                 "role": user.role,
                 "next_route": f"/dashboard/{user.role}",
                 "message": "Welcome to your operational dashboard."
@@ -471,15 +471,16 @@ class UserService:
             return {
                 "profile_complete": True,
                 "tenant_profile_complete": True,
+                "can_apply": False,
                 "role": user.role,
                 "next_route": "/dashboard/admin",
                 "message": "Welcome to the system administration dashboard."
             }
 
-        # Default fallback
         return {
             "profile_complete": True,
             "tenant_profile_complete": True,
+            "can_apply": False,
             "role": user.role,
             "next_route": "/dashboard",
             "message": "Welcome to your dashboard."

@@ -20,9 +20,17 @@ class ApplicationService:
         if existing_application: raise ValidationError("You have already applied for this unit.")
         if unit.status != 'available': raise ValidationError("Unit not available.")
 
-        create_kwargs = {'applicant': applicant, 'property': unit.property_ref, 'unit': unit, 'status': 'pending'}
-        if hasattr(Application, 'ApplicationType'): create_kwargs['application_type'] = Application.ApplicationType.RENTAL
-        else: create_kwargs['application_type'] = 'rental'
+        # ✅ FIX: Removed snapshot fields. The model relies on the 'applicant' ForeignKey.
+        create_kwargs = {
+            'applicant': applicant, 
+            'property': unit.property_ref, 
+            'unit': unit, 
+            'status': 'pending'
+        }
+        if hasattr(Application, 'ApplicationType'): 
+            create_kwargs['application_type'] = Application.ApplicationType.RENTAL
+        else: 
+            create_kwargs['application_type'] = 'rental'
             
         application = Application.objects.create(**create_kwargs)
         
@@ -32,14 +40,14 @@ class ApplicationService:
         return application
 
     @staticmethod
+    @transaction.atomic
     def create_transfer_application(applicant, current_tenancy, to_unit: Unit, reason: str, desired_move_in_date=None, notes='') -> Application:
         if to_unit.status != 'available': raise ValidationError("Target unit not available.")
         
         # ✅ FIXED: Block transfers at UNIT level (tenancy level), not tenant level
-        # Only block if THIS specific unit (the one being transferred FROM) already has a pending transfer
         existing_transfer = Application.objects.filter(
             applicant=applicant,
-            unit=current_tenancy.unit,  # ✅ Check by unit, not just applicant
+            unit=current_tenancy.unit,
             application_type='transfer',
             status__in=['pending', 'under_review', 'approved', 'escalated']
         ).exists()
@@ -47,9 +55,17 @@ class ApplicationService:
         if existing_transfer: 
             raise ValidationError(f"A pending transfer already exists for unit {current_tenancy.unit.unit_code}. Please cancel or complete it first.")
 
-        create_kwargs = {'applicant': applicant, 'property': current_tenancy.property, 'unit': current_tenancy.unit, 'status': 'pending'}
-        if hasattr(Application, 'ApplicationType'): create_kwargs['application_type'] = Application.ApplicationType.TRANSFER
-        else: create_kwargs['application_type'] = 'transfer'
+        # ✅ FIX: Removed snapshot fields.
+        create_kwargs = {
+            'applicant': applicant, 
+            'property': current_tenancy.property, 
+            'unit': current_tenancy.unit, 
+            'status': 'pending'
+        }
+        if hasattr(Application, 'ApplicationType'): 
+            create_kwargs['application_type'] = Application.ApplicationType.TRANSFER
+        else: 
+            create_kwargs['application_type'] = 'transfer'
             
         application = Application.objects.create(**create_kwargs)
 
@@ -64,7 +80,6 @@ class ApplicationService:
         ApplicationNote.objects.create(application=application, note_type='general', content=content, created_by=applicant)
         return application
 
-    # ✅ NEW: Update transfer application (for editing pending transfers)
     @staticmethod
     @transaction.atomic
     def update_transfer_application(application, to_unit: Unit, reason: str, desired_move_in_date=None, notes=''):
@@ -72,16 +87,12 @@ class ApplicationService:
         Updates a pending transfer application.
         Only allowed if application is in pending/under_review status.
         """
-        # Validate application can be edited
         if application.status not in ['pending', 'under_review']:
             raise ValidationError(f"Cannot edit application with status '{application.status}'. Only pending or under_review applications can be edited.")
         
-        # Validate new target unit
         if to_unit.status != 'available' and to_unit != application.unit:
-            # Allow same unit (no change) or available units
             raise ValidationError("Target unit is not available.")
         
-        # Get current note to preserve from_unit
         note = application.notes.filter(content__startswith='TRANSFER_REQUEST:').first()
         if not note:
             raise ValidationError("Transfer details not found.")
@@ -93,10 +104,9 @@ class ApplicationService:
         except Exception as e:
             raise ValidationError(f"Failed to parse transfer details: {str(e)}")
         
-        # Update the note with new details
         new_note_data = {
-            "from_unit": from_unit_id,  # Keep the same from_unit
-            "to_unit": to_unit.id,      # Update to new target unit
+            "from_unit": from_unit_id,
+            "to_unit": to_unit.id,
             "reason": reason,
             "desired_move_in_date": str(desired_move_in_date) if desired_move_in_date else None,
             "notes": notes
@@ -109,13 +119,22 @@ class ApplicationService:
         return application
 
     @staticmethod
+    @transaction.atomic
     def create_eviction_application(applicant, unit: Unit, notice_period_days: int, intended_vacate_date, reason_for_leaving: str, forwarding_address: str) -> Application:
         existing_termination = Application.objects.filter(applicant=applicant, unit=unit, application_type='termination', status__in=['pending', 'under_review', 'approved', 'escalated']).exists()
         if existing_termination: raise ValidationError("Pending termination already exists.")
 
-        create_kwargs = {'applicant': applicant, 'property': unit.property_ref, 'unit': unit, 'status': 'pending'}
-        if hasattr(Application, 'ApplicationType'): create_kwargs['application_type'] = Application.ApplicationType.TERMINATION
-        else: create_kwargs['application_type'] = 'termination'
+        # ✅ FIX: Removed snapshot fields.
+        create_kwargs = {
+            'applicant': applicant, 
+            'property': unit.property_ref, 
+            'unit': unit, 
+            'status': 'pending'
+        }
+        if hasattr(Application, 'ApplicationType'): 
+            create_kwargs['application_type'] = Application.ApplicationType.TERMINATION
+        else: 
+            create_kwargs['application_type'] = 'termination'
             
         application = Application.objects.create(**create_kwargs)
 
@@ -129,6 +148,7 @@ class ApplicationService:
         return application
 
     @staticmethod
+    @transaction.atomic
     def create_extension_application(applicant, current_tenancy, new_end_date, reason='') -> Application:
         existing_extension = Application.objects.filter(
             applicant=applicant, 
@@ -142,6 +162,7 @@ class ApplicationService:
         if new_end_date <= timezone.now().date():
             raise ValidationError("New end date must be in the future.")
 
+        # ✅ FIX: Removed snapshot fields.
         create_kwargs = {
             'applicant': applicant, 
             'property': current_tenancy.property, 
