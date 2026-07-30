@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from datetime import timedelta
 import environ
+import dj_database_url
 
 # Initialize environment variables
 env = environ.Env()
@@ -59,6 +60,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware', # Must be placed as high as possible
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -90,14 +92,9 @@ WSGI_APPLICATION = 'core.wsgi.application'
 
 # DATABASE (PostgreSQL)
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': env('DB_NAME', default='tennacy_db'),
-        'USER': env('DB_USER', default='tennacy_user'),
-        'PASSWORD': env('DB_PASSWORD', default='tennacy_pass'),
-        'HOST': env('DB_HOST', default='localhost'),
-        'PORT': env('DB_PORT', default='5432'),
-    }
+    "default": dj_database_url.config(
+        default=env("DATABASE_URL", default="")
+    )
 }
 
 # CUSTOM USER MODEL
