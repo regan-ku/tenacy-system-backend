@@ -97,10 +97,9 @@ WSGI_APPLICATION = 'core.wsgi.application'
 # DATABASE (PostgreSQL)
 if env("DATABASE_URL", default=None):
     DATABASES = {
-        "default": dj_database_url.parse(
-            env("DATABASE_URL"),
+        "default": dj_database_url.config(
+            default=env("DATABASE_URL"),
             conn_max_age=600,
-            ssl_require=False,
         )
     }
 else:
