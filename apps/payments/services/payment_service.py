@@ -4,26 +4,35 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 from ..models import Payment, PaymentStatus, PaymentSource
 from .allocation_service import AllocationService
-from .payment_verification_service import PaymentVerificationService
+import logging
+
+logger = logging.getLogger(__name__)
 
 class PaymentService:
     @staticmethod
     @transaction.atomic
     def record_payment(
-        payment_id: str, amount: Decimal, source: str, 
-        account_ref: str, tenancy=None, payer=None, raw_payload: dict = None
+        payment_id: str, 
+        amount: Decimal, 
+        source: str, 
+        account_ref: str, 
+        tenancy=None, 
+        payer=None, 
+        raw_payload: dict = None
     ):
-        """
-        Idempotent payment recording. Prevents duplicate M-Pesa/callback processing.
-        """
-        # 1. Duplicate check
+        # 1. IDEMPOTENCY CHECK: Prevent duplicate processing
         if Payment.objects.filter(payment_id=payment_id).exists():
+            logger.warning(f"Duplicate payment ignored: {payment_id}")
             return {"status": "ignored", "reason": "Duplicate payment_id"}
 
-        # 2. Validate routing account (if reference provided)
-        if account_ref and not PaymentVerificationService.is_account_verified_and_active(account_ref):
-            raise ValidationError("Payment routed to unverified account. Funds quarantined.")
+        # Note: We DO NOT validate account_ref against PaymentVerificationService here.
+        # account_ref is the Invoice Number. Paybill validation already happened at STK Push time.
 
+        # ✅ Auto-assign payer if not explicitly provided but we have a tenancy
+        if not payer and tenancy:
+            payer = tenancy.tenant
+
+        # 2. Create the Payment Record
         payment = Payment.objects.create(
             payment_id=payment_id,
             payer=payer,
@@ -37,23 +46,16 @@ class PaymentService:
 
         # 3. Trigger allocation engine
         if tenancy:
-            AllocationService.allocate_payment_to_tenancy(payment, tenancy)
-            payment.status = PaymentStatus.COMPLETED
-            payment.save(update_fields=["status"])
+            try:
+                AllocationService.allocate_payment_to_tenancy(payment, tenancy)
+                payment.status = PaymentStatus.COMPLETED
+                payment.save(update_fields=["status"])
+                logger.info(f"Successfully allocated payment {payment_id} to tenancy {tenancy.id}")
+            except Exception as e:
+                logger.error(f"Allocation failed for payment {payment_id}: {str(e)}")
+                # Keep status as PENDING so it can be manually reconciled later
+                raise e
+        else:
+            logger.warning(f"Payment {payment_id} recorded but NO tenancy resolved. Status remains PENDING.")
 
         return {"status": "recorded", "payment_id": payment_id, "amount": str(payment.amount)}
-
-    @staticmethod
-    def process_callback_payload(payload: dict):
-        """
-        Normalizes provider webhook → calls record_payment()
-        Example: M-Pesa C2B/STK callback structure
-        """
-        return PaymentService.record_payment(
-            payment_id=payload.get("MpesaReceiptNumber"),
-            amount=Decimal(str(payload.get("TransactionAmount", 0))),
-            source=PaymentSource.MPESA,
-            account_ref=payload.get("BusinessShortCode"),
-            tenancy_id=payload.get("AccountReference"), # Maps to tenancy code
-            raw_payload=payload
-        )

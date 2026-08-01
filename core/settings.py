@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 from datetime import timedelta
-
 import environ
 import dj_database_url
 
@@ -16,10 +15,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = env("SECRET_KEY")
 DEBUG = env.bool("DEBUG", default=False)
 
-ALLOWED_HOSTS = env.list(
-    "ALLOWED_HOSTS",
-    default=[]
-)
+ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=[])
+
 # APPLICATION DEFINITION
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -37,27 +34,17 @@ INSTALLED_APPS = [
     'drf_spectacular',
     'django_filters',
     
-    # Custom apps (Order matters for dependencies and migrations)
-    
-    # 1. Core Identity & Structure
+    # Custom apps
     'apps.accounts',
     'apps.properties',
     'apps.agencies',
-    
-    # 2. Operational Core (Marketplace, Tenancy, Applications)
     'apps.marketplace',
     'apps.tenancy', 
     'apps.applications',
-    
-    # 3. External Gateways & Communications
     'apps.integrations',
     'apps.communications',
-    
-    # 4. Financial & Field Operations
     'apps.payments',
     'apps.maintenance',
-    
-    # 5. Document & Intelligence Layer
     'apps.documents',
     'apps.reports',
 ]
@@ -123,7 +110,6 @@ AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator', 'OPTIONS': {'min_length': 8}},
     {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
     {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
-    # Custom validator from accounts app
     {'NAME': 'apps.accounts.utils.validators.CustomPasswordValidator'},
 ]
 
@@ -133,13 +119,10 @@ TIME_ZONE = 'Africa/Nairobi'
 USE_I18N = True
 USE_TZ = True
 
-# STATIC & MEDIA FILES (Crucial for ID/Verification uploads & Documents)
+# STATIC & MEDIA FILES
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-
-STATICFILES_STORAGE = (
-    "whitenoise.storage.CompressedManifestStaticFilesStorage"
-)
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
@@ -155,22 +138,14 @@ CSRF_COOKIE_SAMESITE = 'Lax'
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = 'Lax'
 
-# CORS & CSRF (Allows Next.js frontend to communicate with Django)
-CORS_ALLOWED_ORIGINS = env.list(
-    "CORS_ALLOWED_ORIGINS",
-    default=[]
-)
-
+# CORS & CSRF
+CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
 CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
 
 # DJANGO REST FRAMEWORK
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-    ),
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
-    ),
+    'DEFAULT_AUTHENTICATION_CLASSES': ('rest_framework_simplejwt.authentication.JWTAuthentication',),
+    'DEFAULT_PERMISSION_CLASSES': ('rest_framework.permissions.IsAuthenticated',),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_FILTER_BACKENDS': ('django_filters.rest_framework.DjangoFilterBackend',),
@@ -182,8 +157,8 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_THROTTLE_RATES': {
         'anon': '100/hour',
-        'user': '10000/day',   # ✅ UPDATED: High limit for authenticated users to prevent 429 errors during normal use
-        'login': '20/minute',  # ✅ UPDATED: Changed from 5/hour to 20/minute to prevent lockouts during testing
+        'user': '10000/day',
+        'login': '20/minute',
     }
 }
 
@@ -198,42 +173,44 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
-# CELERY & REDIS (Async Tasks)
+# CELERY & REDIS
 CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default='redis://localhost:6379/1')
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 
-# EMAIL CONFIGURATION (Required for Communications App)
+# EMAIL CONFIGURATION
 EMAIL_BACKEND = env('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')
 EMAIL_HOST = env('EMAIL_HOST', default='localhost')
 EMAIL_PORT = env.int('EMAIL_PORT', default=587)
 EMAIL_HOST_USER = env('EMAIL_HOST_USER', default='')
 EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default='')
 EMAIL_USE_TLS = env.bool('EMAIL_USE_TLS', default=True)
-DEFAULT_FROM_EMAIL = env(
-    "DEFAULT_FROM_EMAIL",
-    default="webmaster@localhost"
-)
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="webmaster@localhost")
 
-# ==========================================
-# INTEGRATION ENCRYPTION (CRITICAL)
-# ==========================================
-# Used to encrypt sensitive external credentials (like M-Pesa B2C keys) 
-# before storing them in the database. Must be persistent across server restarts.
+# INTEGRATION ENCRYPTION KEY
 INTEGRATION_ENCRYPTION_KEY = env('INTEGRATION_ENCRYPTION_KEY', default='fallback-key-change-in-prod')
 
 # ==========================================
-# DRF-SPECTACULAR (API SCHEMA & DOCUMENTATION)
+# M-PESA DARAJA API CONFIGURATION
 # ==========================================
+MPESA_ENVIRONMENT = env("MPESA_ENVIRONMENT", default="sandbox")
+MPESA_CONSUMER_KEY = env("MPESA_CONSUMER_KEY", default="")
+MPESA_CONSUMER_SECRET_ENCRYPTED = env("MPESA_CONSUMER_SECRET_ENCRYPTED", default="")
+MPESA_SHORT_CODE = env("MPESA_SHORT_CODE", default="174379")
+MPESA_PASSKEY_ENCRYPTED = env("MPESA_PASSKEY_ENCRYPTED", default="")
+MPESA_INITIATOR_NAME = env("MPESA_INITIATOR_NAME", default="testapi")
+MPESA_INITIATOR_PASSWORD_ENCRYPTED = env("MPESA_INITIATOR_PASSWORD_ENCRYPTED", default="")
+MPESA_BASE_URL = env("MPESA_BASE_URL", default="https://sandbox.safaricom.co.ke")
+MPESA_CALLBACK_BASE_URL = env("MPESA_CALLBACK_BASE_URL", default="")
+
+# DRF-SPECTACULAR
 SPECTACULAR_SETTINGS = {
     'TITLE': 'Tennacy Platform API',
     'DESCRIPTION': 'Comprehensive property management, tenancy, marketplace, and financial API.',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
-    
-    # JWT Authentication integration for Swagger UI
     'COMPONENT_SPLIT_REQUEST': True,
     'SECURITY': [{'BearerAuth': []}],
     'APPEND_COMPONENTS': {
@@ -242,20 +219,16 @@ SPECTACULAR_SETTINGS = {
                 'type': 'http',
                 'scheme': 'bearer',
                 'bearerFormat': 'JWT',
-                'description': 'Enter your JWT access token. (Do not include the "Bearer " prefix, it is added automatically).'
+                'description': 'Enter your JWT access token.'
             }
         }
     },
-    
-    # Swagger UI specific tweaks
     'SWAGGER_UI_SETTINGS': {
         'deepLinking': True,
-        'persistAuthorization': True, # Keeps you logged in across page refreshes
+        'persistAuthorization': True,
         'displayOperationId': True,
-        'filter': True, # Adds a search bar to filter endpoints
+        'filter': True,
     },
-    
-    # Group endpoints logically by tags (apps)
     'TAGS': [
         {'name': 'Accounts', 'description': 'User registration, login, and profile management.'},
         {'name': 'Properties', 'description': 'Property, unit groups, and unit management.'},
@@ -266,12 +239,3 @@ SPECTACULAR_SETTINGS = {
         {'name': 'Reports', 'description': 'Aggregated analytics and exports.'},
     ]
 }
-
-# CLOUD STORAGE (Optional for Documents App - AWS S3)
-# Uncomment and configure when ready to move from local media to cloud storage
-# DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
-# AWS_ACCESS_KEY_ID = env('AWS_ACCESS_KEY_ID')
-# AWS_SECRET_ACCESS_KEY = env('AWS_SECRET_ACCESS_KEY')
-# AWS_STORAGE_BUCKET_NAME = env('AWS_STORAGE_BUCKET_NAME')
-# AWS_S3_REGION_NAME = env('AWS_S3_REGION_NAME', default='us-east-1')
-# AWS_QUERYSTRING_AUTH = False 

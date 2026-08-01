@@ -7,15 +7,19 @@ from ..utils.encryption import decrypt_secret
 class MpesaConfig:
     @staticmethod
     def get_env_credentials():
+        # ✅ CRITICAL FIX: Safely handle blank Initiator Password to prevent server crash
+        raw_initiator_pwd = getattr(settings, 'MPESA_INITIATOR_PASSWORD_ENCRYPTED', '')
+        initiator_pwd = decrypt_secret(raw_initiator_pwd) if raw_initiator_pwd else ""
+
         return {
             "consumer_key": settings.MPESA_CONSUMER_KEY,
             "consumer_secret": decrypt_secret(settings.MPESA_CONSUMER_SECRET_ENCRYPTED),
             "short_code": settings.MPESA_SHORT_CODE,
             "passkey": decrypt_secret(settings.MPESA_PASSKEY_ENCRYPTED),
             "initiator_name": settings.MPESA_INITIATOR_NAME,
-            "initiator_password": decrypt_secret(settings.MPESA_INITIATOR_PASSWORD_ENCRYPTED),
+            "initiator_password": initiator_pwd, # ✅ Now safely handles blank values
             "base_url": settings.MPESA_BASE_URL,
-            "callback_url": settings.MPESA_CALLBACK_BASE_URL
+            "callback_url": settings.MPESA_CALLBACK_BASE_URL # ✅ This is your active callback URL
         }
 
     @staticmethod

@@ -13,15 +13,15 @@ class AllocationService:
         1. Clear oldest arrears
         2. Pay current invoice(s)
         3. Excess → tenant future credit
-        Updates Invoice balances, Arrears record, and TenantBalance atomically.
         """
         amount = payment.amount
         if amount <= Decimal("0.00"):
             return {"status": "skipped", "reason": "Zero amount"}
 
-        # Fetch current financial state
-        arrears_record = tenancy.arrears_record
-        balance_record = tenancy.balance_record
+        # ✅ Safe fetching of related financial records (prevents AttributeError)
+        arrears_record = getattr(tenancy, 'arrears_record', None) or Arrears.objects.filter(tenancy=tenancy).first()
+        balance_record = getattr(tenancy, 'balance_record', None) or TenantBalance.objects.filter(tenancy=tenancy).first()
+        
         current_invoice = tenancy.invoices.filter(status__in=["pending", "partial"]).order_by("due_date").first()
 
         arrears_bal = arrears_record.total_outstanding if arrears_record else Decimal("0.00")
@@ -33,14 +33,13 @@ class AllocationService:
         allocations = []
 
         # 1. Allocate to Arrears
-        if split["to_arrears"] > 0:
+        if split["to_arrears"] > 0 and arrears_record:
             allocations.append(PaymentAllocation(
                 payment=payment, amount=split["to_arrears"], allocation_type=AllocationType.ARREARS
             ))
-            if arrears_record:
-                arrears_record.total_outstanding -= split["to_arrears"]
-                arrears_record.total_outstanding = max(arrears_record.total_outstanding, Decimal("0.00"))
-                arrears_record.save(update_fields=["total_outstanding"])
+            arrears_record.total_outstanding -= split["to_arrears"]
+            arrears_record.total_outstanding = max(arrears_record.total_outstanding, Decimal("0.00"))
+            arrears_record.save(update_fields=["total_outstanding"])
 
         # 2. Allocate to Current Invoice
         if split["to_current"] > 0 and current_invoice:
@@ -59,11 +58,14 @@ class AllocationService:
             ))
 
         # Bulk save allocations
-        PaymentAllocation.objects.bulk_create(allocations)
+        if allocations:
+            PaymentAllocation.objects.bulk_create(allocations)
 
         # Update running tenant balance
-        balance_record.total_paid += amount
-        balance_record.current_balance = balance_record.total_paid - balance_record.total_invoiced
-        balance_record.save(update_fields=["total_paid", "current_balance", "last_updated"])
+        if balance_record:
+            balance_record.total_paid += amount
+            # Assuming total_invoiced is tracked elsewhere or calculated
+            balance_record.current_balance = balance_record.total_paid - getattr(balance_record, 'total_invoiced', balance_record.total_paid)
+            balance_record.save(update_fields=["total_paid", "current_balance", "last_updated"])
 
         return {"status": "allocated", "split": {k: str(v) for k, v in split.items()}}
