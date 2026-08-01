@@ -4,7 +4,7 @@ from apps.integrations.mpesa.stk_push_service import StkPushService
 from apps.integrations.mpesa.callback_handler import MpesaCallbackHandler
 from ..services.payment_service import PaymentService
 from ..models import Invoice
-from tenancy.models import Tenancy
+from apps.tenancy.models.tenancy import Tenancy
 import logging
 
 logger = logging.getLogger(__name__)
