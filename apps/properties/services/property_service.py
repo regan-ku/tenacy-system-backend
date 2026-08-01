@@ -1,7 +1,7 @@
 from django.db import transaction
 from django.core.exceptions import ValidationError
 from django.db.models import Q
-from ..models import Property, Location, Unit
+from ..models import Property, Location, Unit, UnitGroup
 from .validation_service import PropertyValidationService
 
 class PropertyService:
@@ -20,16 +20,41 @@ class PropertyService:
                                   'property_sub_type': kwargs.get('property_sub_type', '')})
         )
 
+        # ✅ CRITICAL FIX: Determine initial active state
+        # If it's a single unit property, it doesn't need a complex unit generation wizard.
+        # We can consider it "Active" immediately after basic creation.
+        initial_active_state = True if is_single_unit else False
+
         property_obj = Property.objects.create(
             created_by=created_by_user,
             current_manager=created_by_user,
             location=location,
             is_single_unit_property=is_single_unit,
+            is_active=initial_active_state, # ✅ Set based on property type
             **kwargs
         )
         
         PropertyValidationService.validate_property_structure(property_obj)
         return property_obj
+
+    @staticmethod
+    @transaction.atomic
+    def finalize_property_wizard(property: Property, user) -> Property:
+        """
+        Called by the frontend ONLY when the user finishes the Unit Group / Media wizard.
+        Flips the property from 'Draft' to 'Active' so it can be published.
+        """
+        if property.is_active:
+            return property # Already active
+
+        # Safety check: Ensure they actually created units before activating
+        if not property.is_single_unit_property and not property.unit_groups.exists():
+            raise ValidationError("Cannot activate property. Please create at least one Unit Group first.")
+
+        property.is_active = True
+        property.save(update_fields=['is_active', 'updated_at'])
+        
+        return property
 
     @staticmethod
     @transaction.atomic
@@ -68,10 +93,6 @@ class PropertyService:
     def assign_staff_to_property(property_obj: Property, user_to_assign, assigning_user, operational_role: str, notes: str = None):
         """
         Assigns a user (Staff or Tenant) to a property with a specific operational role.
-        Enforces strict business rules:
-        - Landlords can ONLY assign Caretakers.
-        - Agencies can assign Agents, Caretakers, and Property Managers.
-        - Tenants can be assigned as Caretakers (Resident Caretaker).
         """
         from ..models.staff_assignment import PropertyStaffAssignment
         from apps.agencies.models.delegated_property import DelegatedProperty
@@ -81,7 +102,6 @@ class PropertyService:
         assigned_by_entity_type = PropertyStaffAssignment.AssignmentSource.LANDLORD
         assigned_by_agency = None
         
-        # Check if the property is actively delegated to an agency
         active_delegation = DelegatedProperty.objects.filter(
             property_ref=property_obj, 
             status=DelegatedProperty.Status.ACTIVE
@@ -91,25 +111,18 @@ class PropertyService:
             assigned_by_entity_type = PropertyStaffAssignment.AssignmentSource.AGENCY
             assigned_by_agency = active_delegation.agency
             
-            # If delegated, only Agency staff (or the agency owner) can assign staff
             if assigning_user.role not in ['agency', 'agent', 'property_manager', 'admin']:
                 raise ValidationError("This property is fully delegated. Only the managing agency can assign staff.")
                 
         elif assigning_user.role == 'agency':
-            # ✅ FIX: If the user is an Agency and they own/manage the property directly (no delegation record needed)
             assigned_by_entity_type = PropertyStaffAssignment.AssignmentSource.AGENCY
-            
-            # Find the agency owned by this user
             agency = Agency.objects.filter(
                 Q(created_by=assigning_user) | 
                 Q(directors__user=assigning_user) |
                 Q(contact_email=assigning_user.email)
             ).first()
-            
             assigned_by_agency = agency
-            
         else:
-            # Self-managed by Landlord
             if property_obj.created_by != assigning_user and assigning_user.role != 'admin':
                 raise ValidationError("You do not have permission to assign staff to this property.")
 
@@ -118,12 +131,11 @@ class PropertyService:
             if operational_role != PropertyStaffAssignment.OperationalRole.CARETAKER:
                 raise ValidationError("Landlords can only assign Caretakers to their properties.")
         
-        # 3. Handle Tenant as Caretaker (Resident Caretaker)
         if user_to_assign.role == 'tenant':
             if operational_role != PropertyStaffAssignment.OperationalRole.CARETAKER:
                 raise ValidationError("Tenants can only be assigned as Caretakers (Resident Caretaker).")
 
-        # 4. Create or Reactivate the Assignment
+        # 3. Create or Reactivate the Assignment
         assignment, created = PropertyStaffAssignment.objects.get_or_create(
             property=property_obj,
             user=user_to_assign,
@@ -137,7 +149,6 @@ class PropertyService:
         )
         
         if not created and not assignment.is_active:
-            # Reactivate if previously terminated
             assignment.is_active = True
             assignment.terminated_at = None
             assignment.assigned_by_entity_type = assigned_by_entity_type
@@ -171,7 +182,6 @@ class PropertyService:
         if not assignment:
             raise ValidationError("This user is not actively assigned to this property.")
             
-        # Permission check
         if assignment.assigned_by_entity_type == PropertyStaffAssignment.AssignmentSource.LANDLORD:
             if property_obj.created_by != assigning_user and assigning_user.role != 'admin':
                 raise ValidationError("Only the property owner can terminate this assignment.")
