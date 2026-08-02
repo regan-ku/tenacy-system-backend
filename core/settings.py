@@ -34,6 +34,10 @@ INSTALLED_APPS = [
     'drf_spectacular',
     'django_filters',
     
+    # ✅ Cloudinary Storage Apps
+    'cloudinary',
+    'cloudinary_storage',
+    
     # Custom apps
     'apps.accounts',
     'apps.properties',
@@ -119,13 +123,34 @@ TIME_ZONE = 'Africa/Nairobi'
 USE_I18N = True
 USE_TZ = True
 
-# STATIC & MEDIA FILES
+# ==========================================
+# ✅ STATIC & MEDIA FILES (DJANGO 5.0+ COMPATIBLE)
+# ==========================================
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
+# Cloudinary Configuration
+CLOUDINARY_STORAGE = {
+    'CLOUD_NAME': env('CLOUDINARY_CLOUD_NAME', default=''),
+    'API_KEY': env('CLOUDINARY_API_KEY', default=''),
+    'API_SECRET': env('CLOUDINARY_API_SECRET', default=''),
+}
+
+# Modern Django 4.2+ / 5.0 Storage Configuration
+STORAGES = {
+    # ✅ User-uploaded media (Property photos, documents) goes to Cloudinary
+    "default": {
+        "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
+    },
+    # ✅ Static files (CSS, JS, Admin assets) stay local via WhiteNoise
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
+
+# ✅ Kept as a safe local fallback as requested
 MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_ROOT = BASE_DIR / "media" 
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
