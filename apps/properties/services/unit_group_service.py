@@ -41,7 +41,6 @@ class UnitGroupService:
         instance.save()
         return instance
 
-    # ✅ NEW: DELETION LOGIC WITH STRICT BUSINESS RULES
     @staticmethod
     @transaction.atomic
     def delete_unit_group(unit_group: UnitGroup) -> None:
@@ -73,7 +72,7 @@ class UnitGroupService:
                 "Cannot delete this Unit Group because it has active tenancy records."
             )
 
-        # 3. Safe to delete (Django will cascade delete the non-occupied units)
+        # 3. Safe to delete
         unit_group.delete()
 
     @staticmethod
@@ -95,7 +94,9 @@ class UnitGroupService:
             total_floors = 1
 
         units_per_floor = math.ceil(unit_group.capacity / total_floors)
-        created_units = []
+        
+        # ✅ PERFORMANCE FIX: Collect units in a list for bulk creation
+        units_to_create = []
         global_sequence = 1 
         
         for current_floor in range(start_floor, end_floor + 1):
@@ -115,7 +116,8 @@ class UnitGroupService:
                     sequence=global_sequence
                 )
                 
-                unit = Unit.objects.create(
+                # ✅ Instantiate the object, but DO NOT save to the database yet
+                unit = Unit(
                     property_ref=property_obj, 
                     unit_group=unit_group,
                     unit_code=unit_code,
@@ -128,15 +130,28 @@ class UnitGroupService:
                     billing_date=unit_group.billing_date,
                     status='available'
                 )
-                created_units.append(unit)
+                units_to_create.append(unit)
                 global_sequence += 1
             
-        return created_units
+        # ✅ PERFORMANCE FIX: Execute ONE database query to insert ALL units at once
+        if units_to_create:
+            Unit.objects.bulk_create(units_to_create)
+            
+        return units_to_create
 
     @staticmethod
     @transaction.atomic
     def finalize_property_unit_groups(property, user, groups_data: list) -> list:
+        """
+        Wipes existing unit groups/units and regenerates them based on the wizard data.
+        """
         created_groups = []
+        
+        # ✅ CRITICAL FIX: Explicitly delete existing Units BEFORE deleting UnitGroups.
+        # If the Unit model's ForeignKey to UnitGroup is not set to CASCADE, 
+        # deleting the UnitGroup leaves the Units orphaned. They still count 
+        # towards the property's total capacity, causing the validation error.
+        Unit.objects.filter(property_ref=property).delete()
         UnitGroup.objects.filter(property=property).delete()
         
         for group_data in groups_data:
