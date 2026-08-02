@@ -237,8 +237,6 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if not groups_data:
             return Response({"error": "No unit groups provided."}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            # ✅ FIX: Changed property_obj=property_obj to property=property_obj 
-            # to match the expected keyword argument in UnitGroupService
             created_groups = UnitGroupService.finalize_property_unit_groups(
                 property=property_obj, 
                 user=request.user, 
@@ -247,6 +245,28 @@ class PropertyViewSet(viewsets.ModelViewSet):
             serializer = prop_serializers.UnitGroupSerializer(created_groups, many=True)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    # ==========================================
+    # ✅ NEW: FINALIZE PROPERTY WIZARD (ACTIVATE)
+    # ==========================================
+    @extend_schema(summary="Finalize Property Wizard (Activate)")
+    @action(detail=True, methods=['post'], url_path='finalize', permission_classes=[IsPropertyOwnerOrManager])
+    def finalize_wizard(self, request, pk=None):
+        """
+        Endpoint for the frontend to call when the Property Wizard is 100% complete.
+        Flips is_active to True safely after backend validation.
+        """
+        property_obj = self.get_object()
+        
+        try:
+            updated_property = PropertyService.finalize_property_wizard(property_obj, request.user)
+            return Response({
+                "message": "Property wizard completed. Property is now active.",
+                "is_active": updated_property.is_active,
+                "is_marketplace_ready": updated_property.is_marketplace_ready
+            }, status=status.HTTP_200_OK)
+        except ValidationError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @extend_schema(summary="Get Tenant Financials")
@@ -301,7 +321,6 @@ class UnitGroupViewSet(viewsets.ModelViewSet):
         if getattr(self, 'swagger_fake_view', False): return UnitGroup.objects.none()
         property_pk = self.kwargs.get('property_pk')
         
-        # 🚀 PERFORMANCE FIX: Annotate counts to prevent N+1 queries in UnitGroupSerializer
         return UnitGroup.objects.filter(property_id=property_pk).annotate(
             actual_units_count=Count('units', distinct=True),
             occupied_units_count=Count(
