@@ -25,14 +25,14 @@ class MarketplaceSearchFilter:
         if filters.get('max_price'):
             queryset = queryset.filter(min_rent_amount__lte=float(filters['max_price']))
         if filters.get('unit_type'):
-            # Note: Adjust 'unit__unit_type' to match your actual model relation 
-            # (e.g., property__unit_groups__unit_type if linked via groups)
-            queryset = queryset.filter(unit__unit_type=filters['unit_type'])
+            queryset = queryset.filter(
+                Q(unit__unit_type=filters['unit_type']) |
+                Q(property__unit_groups__group_type=filters['unit_type'])
+            )
         if filters.get('property_type'):
             queryset = queryset.filter(property__property_type=filters['property_type'])
-            
-        # ✅ FIX: Prevent duplicate listings when filtering across related units/groups
-        return queryset.distinct()
+
+        return queryset
 
 
 class SearchService:
@@ -44,30 +44,37 @@ class SearchService:
     def search_marketplace(query: str = "", filters: dict = None, user=None, session_id: str = None):
         """
         Executes a marketplace search with text query and advanced filters.
+        Returns unique listing results only.
         """
         filters = filters or {}
-        
+
         # 1. Get base public listings queryset
         queryset = MarketplaceSearchFilter.get_public_listings()
-        
-        # 2. Apply text search (using ACTUAL database fields, not serializer properties)
+
+        # 2. Apply text search (using ACTUAL database fields)
         if query:
             queryset = queryset.filter(
-                Q(property__title__icontains=query) | 
+                Q(property__title__icontains=query) |
                 Q(property__location__city__icontains=query) |
                 Q(property__location__estate__icontains=query)
             )
-            
-        # 3. Apply advanced filters (price, unit type, amenities, etc.)
+
+        # 3. Apply advanced filters (price, unit type, etc.)
         queryset = MarketplaceSearchFilter.apply_filters(queryset, filters)
-        
-        # 4. Execute and get count
+
+        # 4. ✅ CRITICAL FIX: Apply distinct() AFTER all filtering is complete.
+        # This is the single point where duplicates are eliminated.
+        # Doing it here ensures no matter what combination of filters or
+        # text searches are applied, we always get unique Listing objects.
+        queryset = queryset.distinct()
+
+        # 5. Execute and get count
         results_count = queryset.count()
-        results = queryset[:50] # Limit for performance on broad searches
-        
-        # 5. Log search history for recommendations/analytics
+        results = queryset[:50]  # Limit for performance on broad searches
+
+        # 6. Log search history for recommendations/analytics
         SearchService._log_search(query, filters, results_count, user, session_id)
-        
+
         return results, results_count
 
     @staticmethod
