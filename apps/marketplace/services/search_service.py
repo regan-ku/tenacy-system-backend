@@ -1,5 +1,4 @@
-from django.db.models import Q
-from django.conf import settings
+from django.db.models import Q, Count
 from ..models import Listing, SearchHistory
 
 class MarketplaceSearchFilter:
@@ -26,10 +25,14 @@ class MarketplaceSearchFilter:
         if filters.get('max_price'):
             queryset = queryset.filter(min_rent_amount__lte=float(filters['max_price']))
         if filters.get('unit_type'):
+            # Note: Adjust 'unit__unit_type' to match your actual model relation 
+            # (e.g., property__unit_groups__unit_type if linked via groups)
             queryset = queryset.filter(unit__unit_type=filters['unit_type'])
         if filters.get('property_type'):
             queryset = queryset.filter(property__property_type=filters['property_type'])
-        return queryset
+            
+        # ✅ FIX: Prevent duplicate listings when filtering across related units/groups
+        return queryset.distinct()
 
 
 class SearchService:
@@ -88,7 +91,6 @@ class SearchService:
         """
         Returns the most frequently searched estates/cities for trending UI.
         """
-        from django.db.models import Count
         return SearchHistory.objects.filter(
             search_query__isnull=False
         ).exclude(
