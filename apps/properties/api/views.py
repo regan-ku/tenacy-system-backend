@@ -50,7 +50,8 @@ ACTIVE_TENANCY_STATUSES = [
 
 def get_tenant_managed_property_q_filters(user):
     """
-    Returns Q filters for properties that a tenant should be allowed to see.
+    Returns Q filters for properties that a tenant should be allowed to see
+    based on their CURRENT active tenancy's management scope.
 
     Business Rule:
     - A tenant should only see properties under the same management scope
@@ -59,6 +60,9 @@ def get_tenant_managed_property_q_filters(user):
       1. Same property owner / creator
       2. Same current manager
       3. Same delegated agency, if the current property is agency-managed
+
+    Returns:
+        tuple: (q_filters or None, active_tenancy or None)
     """
     if not user or not user.is_authenticated:
         return None, None
@@ -110,7 +114,6 @@ def get_tenant_managed_property_q_filters(user):
                 agency_delegations__status="active",
             )
     except Exception:
-        # If delegation relation is unavailable, fail safely to owner/manager scope only
         pass
 
     return q_filters, active_tenancy
@@ -124,9 +127,11 @@ class IsOwnerOrDelegated(BasePermission):
     """
     Allows access if the user is the property owner/manager OR a delegated agency staff.
 
-    Updated:
-    - Tenants can safely read property lists scoped by get_queryset().
+    Rules:
+    - SAFE_METHODS (GET, HEAD, OPTIONS) are allowed for all authenticated users.
+      The queryset still enforces role-based visibility.
     - Tenants are blocked from creating/updating/deleting property records.
+    - Write operations require ownership, management, or delegation rights.
     """
 
     def has_permission(self, request, view):
@@ -191,21 +196,27 @@ class PropertyViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         # ==========================================
-        # ADMIN SCOPE
+        # ADMIN SCOPE: Full system visibility
         # ==========================================
         if user.role == "admin":
             qs = Property.objects.all()
 
         # ==========================================
-        # ✅ TENANT SCOPE
+        # ✅ TENANT / APPLICANT SCOPE (FIXED)
         # ==========================================
         elif getattr(user, "role", None) == "tenant":
+            # 1. Properties they currently have an active tenancy in
+            #    (for their dashboard, transfers, maintenance, etc.)
             q_filters, active_tenancy = get_tenant_managed_property_q_filters(user)
 
-            if not q_filters:
-                return Property.objects.none()
+            # 2. ✅ FIX: Also allow them to see ANY active property
+            #    so they can browse marketplace and apply for new units.
+            marketplace_filter = Q(is_active=True)
 
-            qs = Property.objects.filter(q_filters)
+            if q_filters:
+                qs = Property.objects.filter(q_filters | marketplace_filter)
+            else:
+                qs = Property.objects.filter(marketplace_filter)
 
         # ==========================================
         # LANDLORD / AGENCY / STAFF SCOPE
@@ -504,7 +515,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     # ==========================================
-    # ✅ TENANT FINANCIALS
+    # ✅ TENANT FINANCIALS (MANAGER-ONLY)
     # ==========================================
 
     @extend_schema(summary="Get Tenant Financials")
@@ -517,11 +528,8 @@ class PropertyViewSet(viewsets.ModelViewSet):
     def tenant_financials(self, request, pk=None):
         """
         Manager-only endpoint.
-
-        Updated:
-        - Previously this allowed any authenticated user.
-        - Now it is locked behind IsOwnerOrDelegated so tenants cannot access
-          financial summaries for properties they do not manage.
+        Locked behind IsOwnerOrDelegated so tenants cannot access
+        financial summaries for properties they do not manage.
         """
         property_obj = self.get_object()
 
@@ -657,40 +665,41 @@ class UnitViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         # ==========================================
-        # ✅ TENANT UNIT SCOPE
+        # ✅ TENANT / APPLICANT UNIT SCOPE (FIXED)
         # ==========================================
-        # Tenants should only see:
-        # 1. Units inside properties under their current management scope
-        # 2. Units that are available / unoccupied
+        # Tenants need to see available units for:
+        # 1. Properties they are applying to from the marketplace
+        # 2. Properties in their management scope (for transfers)
         #
-        # Their own current unit is excluded because it is occupied and
-        # should not be selectable as a transfer destination.
+        # Since this is a nested endpoint (/api/properties/{id}/units/),
+        # the property_pk is already specified in the URL.
+        # We just need to ensure the property is active and show available units.
         if user and user.is_authenticated and getattr(user, "role", None) == "tenant":
-            q_filters, active_tenancy = get_tenant_managed_property_q_filters(user)
+            # ✅ FIX: Ensure the parent property is active before showing units.
+            # This allows tenants to see units for any active property
+            # (marketplace applications) while blocking inactive/private properties.
+            qs = qs.filter(property_ref__is_active=True)
 
-            if not q_filters:
-                return Unit.objects.none()
-
-            allowed_property_ids = (
-                Property.objects.filter(q_filters)
-                .distinct()
-                .values("id")
-            )
-
-            qs = qs.filter(property_ref_id__in=allowed_property_ids)
-
-            # Default tenant behavior: only available units.
+            # Default tenant behavior: only show available units.
             qs = qs.filter(status="available")
 
-            # Extra safety: exclude tenant's current unit if it somehow has available status.
+            # Safety: If they are doing a transfer, exclude their current unit
+            # so they don't accidentally transfer to the exact same unit.
+            q_filters, active_tenancy = get_tenant_managed_property_q_filters(user)
             if active_tenancy and active_tenancy.unit_id:
                 qs = qs.exclude(id=active_tenancy.unit_id)
 
         # ==========================================
-        # PUBLIC / MARKETPLACE SCOPE
+        # PUBLIC / MARKETPLACE SCOPE (Unauthenticated)
         # ==========================================
         elif not user or not user.is_authenticated:
             qs = qs.filter(status="available")
+
+        # ==========================================
+        # MANAGER SCOPE (Landlord/Agency/Agent/Caretaker)
+        # ==========================================
+        # Managers see ALL units regardless of status (available, occupied, maintenance, etc.)
+        # No additional filtering needed — they get the full queryset.
 
         return qs
 
@@ -768,20 +777,14 @@ class PropertyMediaViewSet(viewsets.ModelViewSet):
 
         user = self.request.user
 
-        # If tenant accesses media, restrict to properties in their management scope.
+        # ==========================================
+        # ✅ TENANT / APPLICANT MEDIA SCOPE (FIXED)
+        # ==========================================
+        # Since this is a nested endpoint, the user is explicitly asking for media
+        # of a specific property. If the property is active, they should see its media
+        # (especially when applying from the marketplace or viewing property details).
         if user and user.is_authenticated and getattr(user, "role", None) == "tenant":
-            q_filters, active_tenancy = get_tenant_managed_property_q_filters(user)
-
-            if not q_filters:
-                return PropertyMedia.objects.none()
-
-            allowed_property_ids = (
-                Property.objects.filter(q_filters)
-                .distinct()
-                .values("id")
-            )
-
-            qs = qs.filter(property_ref_id__in=allowed_property_ids)
+            qs = qs.filter(property_ref__is_active=True)
 
         return qs
 

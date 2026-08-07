@@ -385,17 +385,31 @@ class UserService:
             }
 
         # ==========================================
-        # 4. LANDLORD & AGENCY LOGIC
+        # 4. LANDLORD & AGENCY LOGIC (FIXED DRAFT DETECTION)
         # ==========================================
         if user.role in [User.Role.LANDLORD, User.Role.AGENCY]:
             Property = apps.get_model('properties', 'Property')
             
-            owned_properties = Property.objects.filter(created_by=user).annotate(
-                groups_count=Count('unit_groups'),
-                media_count=Count('media')
-            ).order_by('-created_at')
+            # ✅ FIX: Instead of guessing completion by counting units/media (which fails if they 
+            # drop off at Step 5), we strictly check the `is_active` flag. 
+            # A property is ONLY considered complete if it has been fully published (is_active=True).
             
-            has_completed_owned = any(p.groups_count > 0 or p.media_count > 0 for p in owned_properties)
+            # 1. Check for incomplete draft properties (not fully published/active)
+            draft_property = Property.objects.filter(created_by=user, is_active=False).order_by('-created_at').first()
+            
+            if draft_property:
+                # User has an incomplete property wizard. Force them to resume it.
+                return {
+                    "profile_complete": True,
+                    "tenant_profile_complete": tenant_profile_complete,
+                    "can_apply": False,
+                    "role": user.role,
+                    "next_route": f"/properties/wizard?property_id={draft_property.id}",
+                    "message": "Resume your incomplete property setup."
+                }
+            
+            # 2. Check if they have any fully completed/active properties
+            has_completed_owned = Property.objects.filter(created_by=user, is_active=True).exists()
             
             if has_completed_owned:
                 return {
@@ -406,18 +420,8 @@ class UserService:
                     "next_route": f"/dashboard/{user.role}",
                     "message": "Welcome back to your management dashboard."
                 }
-                
-            if owned_properties.exists():
-                draft_property = owned_properties.first()
-                return {
-                    "profile_complete": True,
-                    "tenant_profile_complete": tenant_profile_complete,
-                    "can_apply": False,
-                    "role": user.role,
-                    "next_route": f"/properties/wizard?property_id={draft_property.id}",
-                    "message": "Resume your incomplete property setup."
-                }
             
+            # 3. Agency Delegation Check (If no owned properties, check for delegated ones)
             if user.role == User.Role.AGENCY:
                 Agency = apps.get_model('agencies', 'Agency')
                 DelegatedProperty = apps.get_model('agencies', 'DelegatedProperty')
@@ -442,6 +446,7 @@ class UserService:
                             "message": "Welcome! You have delegated properties to manage."
                         }
             
+            # 4. Fallback: No properties at all, send to creation wizard
             return {
                 "profile_complete": True,
                 "tenant_profile_complete": tenant_profile_complete,
