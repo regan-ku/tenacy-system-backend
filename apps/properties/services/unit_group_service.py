@@ -48,7 +48,6 @@ class UnitGroupService:
         Deletes a unit group and all its associated available/reserved units.
         CRITICAL RULE: Cannot delete if ANY unit in the group is occupied.
         """
-        # 1. Check for occupied units in this group
         occupied_units_exist = Unit.objects.filter(
             unit_group=unit_group, 
             status=UnitStatus.OCCUPIED
@@ -60,7 +59,6 @@ class UnitGroupService:
                 "Terminate all tenancies in this group first."
             )
         
-        # 2. Double-check active tenancy records linked to this group's units
         from apps.tenancy.models.tenancy import Tenancy
         active_tenancies_exist = Tenancy.objects.filter(
             unit__unit_group=unit_group, 
@@ -72,7 +70,6 @@ class UnitGroupService:
                 "Cannot delete this Unit Group because it has active tenancy records."
             )
 
-        # 3. Safe to delete
         unit_group.delete()
 
     @staticmethod
@@ -81,13 +78,19 @@ class UnitGroupService:
         property_obj = unit_group.property
         PropertyValidationService.validate_unit_generation_capacity(property_obj, unit_group.capacity)
         
+        # ✅ IMPROVED: Safer parsing for floor_range to handle non-numeric inputs 
+        # like "Ground", "1", or "Ground-1" without throwing a ValueError.
         try:
             parts = unit_group.floor_range.split('-')
-            start_floor = int(parts[0])
-            end_floor = int(parts[1]) if len(parts) > 1 else start_floor
-        except ValueError:
+            start_floor = int(parts[0]) if parts[0].strip().isdigit() else 1
+            end_floor = int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else start_floor
+        except (ValueError, IndexError, AttributeError):
             start_floor = 1
             end_floor = 1
+            
+        # Safety net: Ensure start is not greater than end
+        if start_floor > end_floor:
+            start_floor, end_floor = end_floor, start_floor
             
         total_floors = end_floor - start_floor + 1
         if total_floors <= 0:
@@ -95,7 +98,6 @@ class UnitGroupService:
 
         units_per_floor = math.ceil(unit_group.capacity / total_floors)
         
-        # ✅ PERFORMANCE FIX: Collect units in a list for bulk creation
         units_to_create = []
         global_sequence = 1 
         
@@ -116,7 +118,6 @@ class UnitGroupService:
                     sequence=global_sequence
                 )
                 
-                # ✅ Instantiate the object, but DO NOT save to the database yet
                 unit = Unit(
                     property_ref=property_obj, 
                     unit_group=unit_group,
@@ -133,7 +134,6 @@ class UnitGroupService:
                 units_to_create.append(unit)
                 global_sequence += 1
             
-        # ✅ PERFORMANCE FIX: Execute ONE database query to insert ALL units at once
         if units_to_create:
             Unit.objects.bulk_create(units_to_create)
             
@@ -147,10 +147,7 @@ class UnitGroupService:
         """
         created_groups = []
         
-        # ✅ CRITICAL FIX: Explicitly delete existing Units BEFORE deleting UnitGroups.
-        # If the Unit model's ForeignKey to UnitGroup is not set to CASCADE, 
-        # deleting the UnitGroup leaves the Units orphaned. They still count 
-        # towards the property's total capacity, causing the validation error.
+        # Explicitly delete existing Units BEFORE deleting UnitGroups to prevent orphaned records.
         Unit.objects.filter(property_ref=property).delete()
         UnitGroup.objects.filter(property=property).delete()
         

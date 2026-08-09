@@ -34,7 +34,6 @@ class PropertyValidationService:
         """
         Ensures generating new units will not exceed the property's total capacity.
         """
-        # ✅ FIX: Use explicit query to avoid related_name issues
         current_units_count = Unit.objects.filter(property_ref=property).count()
         if current_units_count + requested_quantity > property.total_units_capacity:
             raise ValidationError(
@@ -47,8 +46,6 @@ class PropertyValidationService:
         """
         Ensures the billing cycle makes sense for the property type.
         """
-        # ✅ CRITICAL FIX: Safely get enum values to prevent AttributeError 
-        # if some choices (like VACATION_HOME) are missing in models.py
         hospitality_types = [
             getattr(PropertySubType, attr, None) 
             for attr in ['AIRBNB', 'HOTEL', 'GUEST_HOUSE', 'VACATION_HOME', 'HOLIDAY_COTTAGE', 'SERVICED_APARTMENT']
@@ -61,7 +58,6 @@ class PropertyValidationService:
         ]
         short_billing_cycles = [val for val in short_billing_cycles if val is not None]
         
-        # If it's hospitality, daily/weekly is allowed. Otherwise, enforce monthly+.
         if property_sub_type not in hospitality_types and billing_cycle in short_billing_cycles:
             raise ValidationError(
                 f"Billing cycle '{billing_cycle}' is not valid for {property_sub_type}. "
@@ -73,25 +69,18 @@ class PropertyValidationService:
         """
         Determines if the property onboarding should skip the Unit Group creation step.
         """
-        # 1. Explicit flag from the frontend takes absolute precedence
-        if property.is_single_unit_property:
-            return True
-            
-        # ✅ FIX: Safely get enum values for land/plots to prevent AttributeErrors
-        land_and_plot_subtypes = [
-            getattr(PropertySubType, attr, None)
-            for attr in ['RESIDENTIAL_PLOT', 'COMMERCIAL_LAND', 'AGRICULTURAL_LAND', 'LAND']
-        ]
-        land_and_plot_subtypes = [val for val in land_and_plot_subtypes if val is not None]
-        
-        return property.property_sub_type in land_and_plot_subtypes
+        # ✅ UPDATED: We NO LONGER skip unit group creation for single-unit properties.
+        # Even standalone mansions, villas, or plots need at least one Unit Group 
+        # to define their rent, billing cycles, and lease terms.
+        # Therefore, all properties must go through the unit group generation step.
+        return False
 
     @staticmethod
     def validate_unit_group_creation(property: Property, unit_group_data: dict):
         """Validates unit group data before creation."""
         PropertyValidationService.validate_billing_cycle(
             property.property_sub_type, 
-            unit_group_data.get('billing_cycle', 'monthly') # ✅ Used string literal to be safe
+            unit_group_data.get('billing_cycle', 'monthly')
         )
         PropertyValidationService.validate_unit_generation_capacity(
             property, 
