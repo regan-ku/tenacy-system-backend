@@ -78,8 +78,43 @@ class UnitGroupService:
         property_obj = unit_group.property
         PropertyValidationService.validate_unit_generation_capacity(property_obj, unit_group.capacity)
         
-        # ✅ IMPROVED: Safer parsing for floor_range to handle non-numeric inputs 
-        # like "Ground", "1", or "Ground-1" without throwing a ValueError.
+        # ✅ CRITICAL FIX FOR SINGLE-UNIT PROPERTIES
+        # If it's a standalone mansion/villa, the unit IS the building.
+        # Do NOT distribute across floors. Just create the units on Floor 1.
+        if property_obj.is_single_unit_property:
+            units_to_create = []
+            for sequence in range(1, unit_group.capacity + 1):
+                unit_code = generate_unit_code(
+                    property_id=property_obj.id,
+                    group_prefix=unit_group.name,
+                    floor_number=1, # Always ground/floor 1 for standalone structures
+                    sequence=sequence
+                )
+                
+                unit = Unit(
+                    property_ref=property_obj, 
+                    unit_group=unit_group,
+                    unit_code=unit_code,
+                    unit_type=unit_group.unit_type,
+                    floor_number=1, 
+                    rent_amount=unit_group.base_rent_amount,
+                    deposit_amount=unit_group.deposit_amount,
+                    service_charge=unit_group.service_charge,
+                    billing_cycle=unit_group.billing_cycle,
+                    billing_date=unit_group.billing_date,
+                    status='available'
+                )
+                units_to_create.append(unit)
+            
+            if units_to_create:
+                Unit.objects.bulk_create(units_to_create)
+            return units_to_create
+
+        # ==========================================
+        # STANDARD MULTI-FLOOR APARTMENT LOGIC BELOW
+        # ==========================================
+        
+        # Safer parsing for floor_range to handle non-numeric inputs 
         try:
             parts = unit_group.floor_range.split('-')
             start_floor = int(parts[0]) if parts[0].strip().isdigit() else 1
