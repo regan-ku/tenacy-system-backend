@@ -16,7 +16,7 @@ class MediaService:
     def add_media(
         property: Property, 
         unit: Unit = None, 
-        unit_group=None, # Added support for unit_group based on your schema
+        unit_group=None,
         media_type: str = 'image', 
         file=None, 
         url: str = None, 
@@ -42,7 +42,6 @@ class MediaService:
             qs = qs.filter(unit_group=unit_group)
             
         if file and hasattr(file, 'name'):
-            # Check if a file with the exact same original name already exists in this context
             if qs.filter(file__endswith=os.path.basename(file.name)).exists():
                 raise ValidationError(f"A media file named '{file.name}' already exists for this property.")
         
@@ -79,40 +78,40 @@ class MediaService:
     def set_as_cover(media_instance: PropertyMedia) -> PropertyMedia:
         """
         Promotes a specific media instance to be the cover photo.
-        Uses select_for_update() to prevent race conditions (crashing) 
-        if multiple requests try to update the cover simultaneously.
+        Uses select_for_update() to prevent race conditions.
         """
         cover_source = media_instance.file or media_instance.url
         if not cover_source:
             raise ValidationError("Cannot set an empty file/URL as cover.")
 
         # ==========================================
-        # 🛡️ 4. CONCURRENCY PROTECTION (Prevents Crashes)
+        # 🛡️ 4. CONCURRENCY PROTECTION
         # ==========================================
         if media_instance.unit:
-            # Lock the Unit row in the DB until this transaction finishes
             unit = Unit.objects.select_for_update().get(pk=media_instance.unit.pk)
             
             old_cover = unit.cover_photo
             unit.cover_photo = cover_source
             unit.save(update_fields=['cover_photo'])
             
-            # Clean up old orphaned file if it's no longer used
             MediaService._cleanup_orphaned_file(media_instance.property, old_cover)
             
         elif media_instance.unit_group:
-            # If your UnitGroup model has a cover_photo field, handle it here.
-            # For now, we fallback to property if unit_group doesn't have its own cover.
-            pass 
-        else:
-            # Lock the Property row in the DB
+            # For single-unit properties, unit_group cover falls back to property cover
             prop = Property.objects.select_for_update().get(pk=media_instance.property.pk)
             
             old_cover = prop.cover_photo
             prop.cover_photo = cover_source
             prop.save(update_fields=['cover_photo'])
             
-            # Clean up old orphaned file if it's no longer used
+            MediaService._cleanup_orphaned_file(prop, old_cover)
+        else:
+            prop = Property.objects.select_for_update().get(pk=media_instance.property.pk)
+            
+            old_cover = prop.cover_photo
+            prop.cover_photo = cover_source
+            prop.save(update_fields=['cover_photo'])
+            
             MediaService._cleanup_orphaned_file(prop, old_cover)
             
         return media_instance
@@ -127,7 +126,6 @@ class MediaService:
         property_obj = media_instance.property
         unit_obj = media_instance.unit
         
-        # Check if this specific media file is currently set as the cover photo
         cover_source = media_instance.file or media_instance.url
         is_current_cover = False
         
@@ -139,19 +137,16 @@ class MediaService:
         # ==========================================
         # 🛡️ 5. PHYSICAL FILE CLEANUP
         # ==========================================
-        # Before deleting the DB record, check if we need to delete the physical file.
-        # We only delete the physical file if NO OTHER media record is using it.
         file_to_delete = media_instance.file
-        media_instance.delete() # Delete DB record first
+        media_instance.delete()
         
         if file_to_delete:
-            # Check if any other media instance is still using this exact file path
             is_still_used = PropertyMedia.objects.filter(file=file_to_delete).exists()
             if not is_still_used:
                 try:
-                    file_to_delete.delete(save=False) # Delete physical file from storage
+                    file_to_delete.delete(save=False)
                 except Exception:
-                    pass # Fail silently on file deletion; DB is the source of truth
+                    pass
 
         # ==========================================
         # 🛡️ 6. COVER PHOTO PROMOTION
@@ -161,13 +156,11 @@ class MediaService:
             if unit_obj:
                 filter_kwargs['unit'] = unit_obj
                 
-            # Get the next media ordered by display_order, then creation date
             next_media = PropertyMedia.objects.filter(**filter_kwargs).order_by('display_order', 'created_at').first()
             
             if next_media:
                 MediaService.set_as_cover(next_media)
             else:
-                # No media left, clear the cover photo field safely
                 if unit_obj:
                     unit_obj.cover_photo = None
                     unit_obj.save(update_fields=['cover_photo'])
@@ -178,15 +171,68 @@ class MediaService:
         return True
 
     @staticmethod
+    def get_effective_unit_media(unit: Unit) -> list:
+        """
+        ✅ NEW: Returns the effective media for a unit.
+        
+        For single-unit properties, returns property-level media as the unit's media
+        since the property IS the unit. For multi-unit properties, returns only
+        unit-specific media.
+        
+        This is the method the marketplace and tenant dashboards should call
+        when displaying unit media.
+        """
+        if not unit or not unit.property_ref:
+            return []
+            
+        property_obj = unit.property_ref
+        
+        # ✅ SINGLE-UNIT PROPERTY: Return property-level media as unit media
+        if property_obj.is_single_unit_property:
+            return list(
+                PropertyMedia.objects.filter(
+                    property=property_obj,
+                    unit__isnull=True,
+                    unit_group__isnull=True,
+                    media_type__in=['image', 'video']
+                ).order_by('display_order', 'created_at')
+            )
+        
+        # MULTI-UNIT PROPERTY: Return only unit-specific media
+        return list(
+            PropertyMedia.objects.filter(
+                unit=unit,
+                media_type__in=['image', 'video']
+            ).order_by('display_order', 'created_at')
+        )
+
+    @staticmethod
+    def get_effective_unit_cover(unit: Unit):
+        """
+        ✅ NEW: Returns the effective cover photo for a unit.
+        
+        For single-unit properties, returns the property cover photo.
+        For multi-unit properties, returns the unit's own cover photo.
+        """
+        if not unit or not unit.property_ref:
+            return None
+            
+        property_obj = unit.property_ref
+        
+        if property_obj.is_single_unit_property:
+            return property_obj.cover_photo
+        
+        return unit.cover_photo
+
+    @staticmethod
     def _cleanup_orphaned_file(property_obj: Property, old_file_field):
         """
         Helper to delete a physical file from storage if it is no longer 
-        referenced by ANY PropertyMedia record. Prevents storage bloat.
+        referenced by ANY PropertyMedia record.
         """
         if not old_file_field:
             return
             
-        # Check if any media record still points to this old file
         is_still_used = PropertyMedia.objects.filter(
             property=property_obj, 
             file=old_file_field
@@ -196,4 +242,4 @@ class MediaService:
             try:
                 old_file_field.delete(save=False)
             except Exception:
-                pass # Fail silently, storage cleanup is secondary to DB integrity
+                pass
