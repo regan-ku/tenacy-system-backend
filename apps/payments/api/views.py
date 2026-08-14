@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
+from django.db.models import Sum
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 
 from .serializers import (
@@ -10,7 +11,6 @@ from .serializers import (
     ArrearsSerializer, TenantBalanceSerializer, WaiverRequestSerializer,
     RefundRequestSerializer, STKRequestSerializer
 )
-# ✅ ADDED: PaymentAccountVerification to imports
 from ..models import PaymentAccount, PaymentAccountVerification, Invoice, Payment, Arrears, TenantBalance, Receipt
 from ..permissions.payment_permissions import (
     IsFinancialStakeholder, CanTriggerPaymentRequest, CanApproveFinancialOverride,
@@ -32,7 +32,6 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
     lookup_field = "id"
 
     def get_queryset(self):
-        # ✅ SPECTACULAR GUARD: Prevents AnonymousUser crashes
         if getattr(self, "swagger_fake_view", False):
             return PaymentAccount.objects.none()
         user = self.request.user
@@ -41,11 +40,8 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
             qs = PaymentAccount.objects.all()
         return qs.order_by("-is_default", "-is_verified", "-created_at")
 
-    # ✅ FIX: Assign owner AND auto-create a pending verification record
     def perform_create(self, serializer):
         account = serializer.save(owner=self.request.user)
-        
-        # Automatically generate a pending verification request
         PaymentAccountVerification.objects.create(
             payment_account=account,
             requested_by=self.request.user,
@@ -76,10 +72,27 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False): return Invoice.objects.none()
         user = self.request.user
-        qs = Invoice.objects.select_related("tenancy__tenant", "tenancy__target_property")
+        qs = Invoice.objects.select_related("tenancy__tenant", "tenancy__target_property", "tenancy__unit")
         if user.is_staff:
             return qs.order_by("-created_at")
         return qs.filter(tenancy__tenant=user).order_by("-created_at")
+
+    # ✅ FIX: Corrected "balance" to "balance_due" to match the Invoice model
+    @extend_schema(responses={200: OpenApiResponse(description="Tenant invoice summary for KPIs")})
+    @action(detail=False, methods=["get"], url_path="my-summary")
+    def my_summary(self, request):
+        """Returns aggregated totals for the tenant's dashboard KPIs without fetching all records."""
+        user = request.user
+        invoices = Invoice.objects.filter(tenancy__tenant=user)
+        
+        # ✅ FIX: Use 'balance_due' and cast to float for safe JSON serialization
+        total_due = invoices.filter(status__in=["pending", "partial", "overdue"]).aggregate(Sum("balance_due"))["balance_due__sum"] or 0
+        overdue_count = invoices.filter(status="overdue").count()
+        
+        return Response({
+            "total_outstanding": float(total_due),
+            "overdue_invoices_count": overdue_count
+        })
 
 # ================= PAYMENTS & FINANCIAL HISTORY =================
 class PaymentHistoryViewSet(viewsets.ReadOnlyModelViewSet):
@@ -97,7 +110,7 @@ class PaymentHistoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 class FinancialDashboardView(mixins.ListModelMixin, viewsets.GenericViewSet):
     """Aggregates arrears & balance data for tenant/owner dashboards."""
-    serializer_class = ArrearsSerializer  # ✅ Added for schema compliance
+    serializer_class = ArrearsSerializer
     permission_classes = [IsAuthenticated, IsFinancialStakeholder]
     
     def get_queryset(self):
@@ -121,12 +134,29 @@ class FinancialDashboardView(mixins.ListModelMixin, viewsets.GenericViewSet):
             "balance": TenantBalanceSerializer(balance).data if balance else None
         })
 
+# ================= TENANT PAYMENT PROFILE =================
+class TenantPaymentProfileView(viewsets.ViewSet):
+    """Handles tenant-specific payment preferences for seamless checkout."""
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(responses={200: OpenApiResponse(description="Tenant payment preferences")})
+    @action(detail=False, methods=["get"], url_path="preferences")
+    def preferences(self, request):
+        """Fetches the tenant's last used or profile M-Pesa number for seamless checkout."""
+        user = request.user
+        last_payment = Payment.objects.filter(payer=user, status__in=["success", "completed"]).order_by("-paid_at").first()
+        preferred_phone = getattr(last_payment, 'payer_phone', None) or getattr(user, 'phone_number', '')
+        
+        return Response({
+            "preferred_phone": preferred_phone or ""
+        })
+
 # ================= FINANCIAL ACTIONS =================
 class FinancialActionView(viewsets.ViewSet):
     permission_classes = [IsAuthenticated, CanTriggerPaymentRequest]
 
     @extend_schema(request=STKRequestSerializer, responses={200: OpenApiResponse(description="STK Push initiated")})
-    @action(detail=False, methods=["post"])
+    @action(detail=False, methods=["post"], url_path="stk-push")
     def request_stk_push(self, request):
         serializer = STKRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -139,7 +169,7 @@ class FinancialActionView(viewsets.ViewSet):
         return Response(result)
 
     @extend_schema(request=WaiverRequestSerializer, responses={200: OpenApiResponse(description="Waiver applied successfully")})
-    @action(detail=False, methods=["post"])
+    @action(detail=False, methods=["post"], url_path="waiver")
     def apply_waiver(self, request):
         self.permission_classes = [IsAuthenticated, CanApproveFinancialOverride]
         self.check_permissions(request)
@@ -155,7 +185,7 @@ class FinancialActionView(viewsets.ViewSet):
         return Response(result)
 
     @extend_schema(request=RefundRequestSerializer, responses={201: OpenApiResponse(description="Refund requested successfully")})
-    @action(detail=False, methods=["post"])
+    @action(detail=False, methods=["post"], url_path="refund")
     def request_refund(self, request):
         self.permission_classes = [IsAuthenticated, CanApproveFinancialOverride]
         self.check_permissions(request)
@@ -172,21 +202,20 @@ class FinancialActionView(viewsets.ViewSet):
 
 # ================= RECEIPTS =================
 class ReceiptDownloadSerializer(serializers.Serializer):
-    """Explicitly named serializer for OpenAPI compliance"""
     download_url = serializers.URLField(help_text="Secure presigned download link")
     expires_at = serializers.DateTimeField(help_text="URL expiration timestamp")
 
 class ReceiptViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = ReceiptDownloadSerializer  # ✅ Named class
+    serializer_class = ReceiptDownloadSerializer
     permission_classes = [IsAuthenticated, IsFinancialStakeholder]
     lookup_field = "id"
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False): return Receipt.objects.none()
-        return Receipt.objects.none()  # Fetched dynamically via action
+        return Receipt.objects.none()
 
     @extend_schema(responses={200: ReceiptDownloadSerializer})
-    @action(detail=True, methods=["get"])
+    @action(detail=True, methods=["get"], url_path="download")
     def download(self, request, id=None):
         receipt_data = ReceiptService.get_receipt_data(id)
         if not receipt_data:

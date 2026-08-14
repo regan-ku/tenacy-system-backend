@@ -236,7 +236,7 @@ class UnitSerializer(serializers.ModelSerializer):
             'allows_pets', 'parking_spaces', 'created_at', 'unit_code' 
         ]
         extra_kwargs = {
-            'cover_photo': {'help_text': 'Main display image for the specific unit.'},
+            'cover_photo': {'help_text': 'Main display image for the specific unit.', 'required': False, 'allow_null': True},
             'unit_type': {'required': False},
             'rent_amount': {'required': False},
             'deposit_amount': {'required': False},
@@ -262,6 +262,38 @@ class UnitSerializer(serializers.ModelSerializer):
             status__in=['active', 'extended', 'pending_payment']
         ).exists()
         return 'occupied' if has_active else obj.status
+
+    # ✅ BULLETPROOF FIX: Override representation to inject effective cover photo
+    def to_representation(self, instance):
+        """
+        Intercepts the JSON output to inject the effective cover photo.
+        For single-unit properties, this automatically returns the Property's cover photo.
+        Keeps the field writable for frontend PATCH uploads.
+        """
+        ret = super().to_representation(instance)
+        request = self.context.get('request')
+        
+        # Use your bulletproof MediaService
+        effective_cover = MediaService.get_effective_unit_cover(instance)
+        
+        if effective_cover:
+            # 1. If it's a Django FileField/ImageField object
+            if hasattr(effective_cover, 'url'):
+                if request:
+                    ret['cover_photo'] = request.build_absolute_uri(effective_cover.url)
+                else:
+                    ret['cover_photo'] = effective_cover.url
+            else:
+                # 2. Fallback for string URLs (ensure they are absolute if relative)
+                cover_str = str(effective_cover)
+                if request and cover_str.startswith('/'):
+                    ret['cover_photo'] = request.build_absolute_uri(cover_str)
+                else:
+                    ret['cover_photo'] = cover_str
+        else:
+            ret['cover_photo'] = None
+            
+        return ret
 
     def create(self, validated_data):
         property_obj = self.context.get('property')
