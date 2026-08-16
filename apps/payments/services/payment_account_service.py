@@ -47,33 +47,32 @@ class PaymentAccountService:
         return account
 
     @staticmethod
-    def get_active_routing_account(property_id=None, user_id=None):
+    def get_active_routing_account(property_obj=None, user_id=None):
         """
         Returns the verified, active payment account for direct collection.
-        Priority: Property-specific default → User-level default → First active account.
+        ✅ UPDATED: Respects the Agency Delegation Model from the Project Write-Up.
+        Priority: 
+        1. Delegated Agency Account (if property is agency-managed)
+        2. Property-specific Landlord Account
+        3. User-level (Landlord/Agency) Default Account
         """
         qs = PaymentAccount.objects.filter(is_active=True, is_verified=True)
         
-        if property_id:
-            account = qs.filter(property_id=property_id, is_default=True).first()
-            if not account:
-                account = qs.filter(property_id=property_id).first()
-            return account
+        if property_obj:
+            # 1. Check if property is delegated to an agency (Assuming 'current_manager' holds the agency/manager)
+            manager = getattr(property_obj, 'current_manager', None)
+            if manager and getattr(manager, 'role', None) in ['agency', 'manager']:
+                agency_account = qs.filter(owner=manager, is_default=True).first() or qs.filter(owner=manager).first()
+                if agency_account:
+                    return agency_account
             
+            # 2. Fallback to property-specific landlord account
+            prop_account = qs.filter(property=property_obj, is_default=True).first() or qs.filter(property=property_obj).first()
+            if prop_account:
+                return prop_account
+                
+        # 3. Fallback to global user default
         if user_id:
-            return qs.filter(owner_id=user_id, is_default=True).first() or qs.filter(owner_id=user_id).first()
+            return qs.filter(owner_id=user_id, property__isnull=True, is_default=True).first() or qs.filter(owner_id=user_id, property__isnull=True).first()
         
         return None
-
-    @staticmethod
-    @transaction.atomic
-    def toggle_active(account_id, user_id, activate=True):
-        """
-        Activates/deactivates account ONLY if verified.
-        """
-        account = PaymentAccount.objects.get(id=account_id, owner_id=user_id)
-        if activate and not account.is_verified:
-            raise ValidationError("Cannot activate unverified account. Complete verification first.")
-        account.is_active = activate
-        account.save(update_fields=["is_active"])
-        return account

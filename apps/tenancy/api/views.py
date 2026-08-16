@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiResponse
 from django.utils import timezone
+from django.db.models import Prefetch # ✅ ADDED
 
 from django.contrib.auth import get_user_model
 
@@ -14,6 +15,7 @@ from ..permissions.tenancy_permissions import (
     IsTenantOfUnit, IsPropertyManagerOrOwner, CanApproveTenancyActions
 )
 from apps.applications.models import Application # ✅ Added for unified cancel actions
+from apps.payments.models import Invoice # ✅ ADDED: To prefetch unpaid invoices
 
 User = get_user_model()
 
@@ -34,16 +36,31 @@ class TenancyViewSet(viewsets.ModelViewSet):
         if not self.request.user.is_authenticated:
             return Tenancy.objects.none()
             
+        # ✅ NEW: Prefetch unpaid invoices to calculate next due date & invoice ID efficiently
+        # This prevents N+1 query performance issues on the tenant dashboard
+        unpaid_invoices_prefetch = Prefetch(
+            'invoices',
+            queryset=Invoice.objects.filter(status__in=['pending', 'partial', 'overdue']).order_by('due_date'),
+            to_attr='unpaid_invoices'
+        )
+            
         user = self.request.user
         if user.role == 'admin':
-            return Tenancy.objects.all().select_related('tenant', 'unit', 'property')
+            return Tenancy.objects.all().select_related(
+                'tenant', 'unit', 'property', 'balance_record', 'arrears_record'
+            ).prefetch_related(unpaid_invoices_prefetch)
+            
         if user.role == 'tenant':
-            return Tenancy.objects.filter(tenant=user).select_related('unit', 'property')
+            return Tenancy.objects.filter(tenant=user).select_related(
+                'unit', 'property', 'balance_record', 'arrears_record'
+            ).prefetch_related(unpaid_invoices_prefetch)
         
         return (
             Tenancy.objects.filter(property__created_by=user) | 
             Tenancy.objects.filter(property__current_manager=user)
-        ).select_related('tenant', 'unit', 'property').distinct()
+        ).select_related(
+            'tenant', 'unit', 'property', 'balance_record', 'arrears_record'
+        ).prefetch_related(unpaid_invoices_prefetch).distinct()
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve', 'list_transfers', 'list_terminations', 'list_notes']:

@@ -25,37 +25,40 @@ class PaymentService:
             logger.warning(f"Duplicate payment ignored: {payment_id}")
             return {"status": "ignored", "reason": "Duplicate payment_id"}
 
-        # Note: We DO NOT validate account_ref against PaymentVerificationService here.
-        # account_ref is the Invoice Number. Paybill validation already happened at STK Push time.
-
         # ✅ Auto-assign payer if not explicitly provided but we have a tenancy
         if not payer and tenancy:
             payer = tenancy.tenant
 
-        # 2. Create the Payment Record
+        # 2. Determine initial status based on source
+        # Manual payments (Cash/Bank) require manager reconciliation before allocation
+        manual_sources = ['cash', 'bank_transfer', 'manual', 'cheque']
+        initial_status = PaymentStatus.PENDING_RECONCILIATION if source in manual_sources else PaymentStatus.PENDING
+
+        # 3. Create the Payment Record
         payment = Payment.objects.create(
             payment_id=payment_id,
             payer=payer,
             amount=amount.quantize(Decimal("0.01")),
             source=source,
-            status=PaymentStatus.PENDING,
+            status=initial_status,
             account_received_at=account_ref,
             raw_payload=raw_payload or {},
             paid_at=timezone.now()
         )
 
-        # 3. Trigger allocation engine
-        if tenancy:
+        # 4. Trigger allocation engine ONLY for automated sources (M-Pesa, Card, etc.)
+        if tenancy and source not in manual_sources:
             try:
                 AllocationService.allocate_payment_to_tenancy(payment, tenancy)
                 payment.status = PaymentStatus.COMPLETED
                 payment.save(update_fields=["status"])
-                logger.info(f"Successfully allocated payment {payment_id} to tenancy {tenancy.id}")
+                logger.info(f"Successfully allocated automated payment {payment_id} to tenancy {tenancy.id}")
             except Exception as e:
                 logger.error(f"Allocation failed for payment {payment_id}: {str(e)}")
-                # Keep status as PENDING so it can be manually reconciled later
                 raise e
+        elif source in manual_sources:
+            logger.info(f"Manual payment {payment_id} recorded. Awaiting manager reconciliation.")
         else:
             logger.warning(f"Payment {payment_id} recorded but NO tenancy resolved. Status remains PENDING.")
 
-        return {"status": "recorded", "payment_id": payment_id, "amount": str(payment.amount)}
+        return {"status": "recorded", "payment_id": payment_id, "amount": str(payment.amount), "requires_reconciliation": source in manual_sources}

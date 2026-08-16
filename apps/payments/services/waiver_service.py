@@ -13,7 +13,7 @@ class WaiverService:
     def apply_waiver(invoice_id: str, amount: Decimal, reason: str, approved_by_user):
         """
         Creates an approved waiver and reduces invoice/tenant balances.
-        Only callable by authorized managers/owners (enforced at API/permission layer).
+        ✅ FIX: No longer mutates `total_amount` to preserve audit trails.
         """
         invoice = Invoice.objects.select_related("tenancy").get(id=invoice_id)
         if invoice.status == "paid":
@@ -35,18 +35,18 @@ class WaiverService:
             approved_by=approved_by_user
         )
 
-        # Adjust financial records
-        invoice.total_amount -= amount
-        invoice.balance_due = max(Decimal("0.00"), invoice.balance_due - amount)
-        invoice.save(update_fields=["total_amount", "balance_due", "updated_at"])
+        # ✅ FIX: Recalculate balance dynamically (Total - Paid - Waived)
+        total_waived = sum(w.amount for w in invoice.financial_waivers.all())
+        invoice.balance_due = max(Decimal("0.00"), invoice.total_amount - invoice.amount_paid - total_waived)
+        invoice.save(update_fields=["balance_due", "updated_at"])
         
         # Re-evaluate status
         InvoiceService.update_invoice_status(invoice.id)
 
         # Update tenant running balance
-        balance = invoice.tenancy.balance_record
+        balance, _ = invoice.tenancy.balance_record.get_or_create(tenancy=invoice.tenancy)
         balance.total_invoiced -= amount
-        balance.current_balance = balance.total_paid - balance.total_invoiced
+        balance.current_balance = balance.total_invoiced - balance.total_paid
         balance.save(update_fields=["total_invoiced", "current_balance", "last_updated"])
 
         logger.info(f"Waiver {waiver.id} applied | Amount: {amount} | Approved by: {approved_by_user.email}")

@@ -11,7 +11,6 @@ class InvoiceService:
     def create_invoice(tenancy, period_start, period_end, due_date, line_items: list[dict]):
         """
         Generates a new invoice with validated line items.
-        Enforces: no duplicate invoices for same period, immutable after payment.
         """
         existing = Invoice.objects.filter(
             tenancy=tenancy,
@@ -35,7 +34,6 @@ class InvoiceService:
             status=InvoiceStatus.PENDING
         )
 
-        # Create line items in bulk
         InvoiceItem.objects.bulk_create([
             InvoiceItem(invoice=invoice, **item) for item in items
         ])
@@ -44,49 +42,62 @@ class InvoiceService:
 
     @staticmethod
     @transaction.atomic
-    def generate_move_in_invoices(tenancy):
+    def generate_move_in_invoice(tenancy):
         """
-        ✅ NEW: Generates specific one-off invoices for Deposit and Service Charge.
-        These must be paid (or waived) before the tenancy can transition to 'ACTIVE'.
+        ✅ UPDATED: Generates a SINGLE Move-In Invoice with Rent, Deposit, and Service Charge.
+        This allows the tenant to pay everything in one M-Pesa STK push.
         """
-        due_date = timezone.now().date() + timezone.timedelta(days=7) # Example: 7 days to pay move-in costs
+        line_items = []
         
-        # 1. Deposit Invoice
-        if tenancy.deposit_amount and tenancy.deposit_amount > 0:
-            Invoice.objects.create(
-                tenancy=tenancy,
-                invoice_number=InvoiceGenerator.generate_invoice_number(),
-                period_start=tenancy.lease_start_date,
-                period_end=tenancy.lease_start_date, # One-off event
-                due_date=due_date,
-                total_amount=tenancy.deposit_amount,
-                amount_paid=Decimal("0.00"),
-                balance_due=tenancy.deposit_amount,
-                status=InvoiceStatus.PENDING,
-                description="Refundable Security Deposit" # Ensure your Invoice model has a description/notes field
-            )
+        # 1. First Month Rent
+        if tenancy.rent_amount and tenancy.rent_amount > 0:
+            line_items.append({
+                "item_type": "rent", 
+                "description": "First Month Rent", 
+                "amount": tenancy.rent_amount, 
+                "quantity": 1
+            })
             
-        # 2. Service Charge Invoice
+        # 2. Security Deposit
+        if tenancy.deposit_amount and tenancy.deposit_amount > 0:
+            line_items.append({
+                "item_type": "deposit", 
+                "description": "Refundable Security Deposit", 
+                "amount": tenancy.deposit_amount, 
+                "quantity": 1
+            })
+            
+        # 3. Service Charge
         if tenancy.service_charge_amount and tenancy.service_charge_amount > 0:
-            Invoice.objects.create(
-                tenancy=tenancy,
-                invoice_number=InvoiceGenerator.generate_invoice_number(),
-                period_start=tenancy.lease_start_date,
-                period_end=tenancy.lease_start_date, # One-off event
-                due_date=due_date,
-                total_amount=tenancy.service_charge_amount,
-                amount_paid=Decimal("0.00"),
-                balance_due=tenancy.service_charge_amount,
-                status=InvoiceStatus.PENDING,
-                description="Non-refundable Service Charge"
-            )
+            line_items.append({
+                "item_type": "service_charge", 
+                "description": "Non-refundable Service Charge", 
+                "amount": tenancy.service_charge_amount, 
+                "quantity": 1
+            })
+            
+        if not line_items:
+            return None
+
+        # Set due date to 7 days from now
+        due_date = timezone.now().date() + timezone.timedelta(days=7)
+        
+        invoice = InvoiceService.create_invoice(
+            tenancy=tenancy,
+            period_start=tenancy.start_date,
+            period_end=tenancy.start_date, # One-off event
+            due_date=due_date,
+            line_items=line_items
+        )
+        
+        return invoice
 
     @staticmethod
     @transaction.atomic
     def update_invoice_status(invoice_id):
         """
-        Recalculates balance & updates status based on allocated payments.
-        PENDING → PARTIAL → PAID | OVERDUE (if past due_date)
+        Recalculates balance & updates status based on allocated payments AND waivers.
+        ✅ FIX: Now accounts for waivers dynamically without mutating total_amount.
         """
         invoice = Invoice.objects.select_related("tenancy").get(id=invoice_id)
         
@@ -95,12 +106,17 @@ class InvoiceService:
             
         # Calculate actual allocated amount
         allocated = sum(al.amount for al in invoice.payment_allocations.all())
+        
+        # ✅ FIX: Calculate total waived dynamically from Waiver model
+        total_waived = sum(w.amount for w in invoice.financial_waivers.all())
+        
         invoice.amount_paid = allocated
-        invoice.balance_due = invoice.total_amount - allocated
+        # Balance = Total - Paid - Waived
+        invoice.balance_due = max(Decimal("0.00"), invoice.total_amount - allocated - total_waived)
         
         if invoice.balance_due <= Decimal("0.00"):
             invoice.status = InvoiceStatus.PAID
-        elif allocated > Decimal("0.00"):
+        elif allocated > Decimal("0.00") or total_waived > Decimal("0.00"):
             invoice.status = InvoiceStatus.PARTIAL
         elif timezone.now().date() > invoice.due_date:
             invoice.status = InvoiceStatus.OVERDUE

@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema_field
@@ -10,6 +11,8 @@ from ..services import (
     ExtensionService, TerminationService, WaiverService
 )
 from ..services.tenancy_state_service import TenancyStateService
+
+from apps.payments.services.billing_cycle_service import BillingCycleService
 
 User = get_user_model()
 
@@ -24,11 +27,25 @@ class TenancyNoteSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'tenancy_id', 'created_by_email', 'created_at']
 
 
+class TenancyWaiverSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TenancyWaiver
+        # Includes 'tenancy', 'amount', and 'created_at' for the Financial Ledger
+        fields = ['id', 'tenancy', 'waiver_type', 'amount', 'reason', 'status', 'requested_by', 'approved_by', 'created_at']
+        read_only_fields = ['id', 'status', 'approved_by', 'created_at']
+
+
 class TenancySerializer(serializers.ModelSerializer):
     tenant_email = serializers.EmailField(source='tenant.email', read_only=True)
     unit_code = serializers.CharField(source='unit.unit_code', read_only=True)
     property_title = serializers.CharField(source='property.title', read_only=True)
     
+    current_balance = serializers.SerializerMethodField()
+    arrears_amount = serializers.SerializerMethodField()
+    next_due_date = serializers.SerializerMethodField()
+    next_invoice_id = serializers.SerializerMethodField()
+    next_billing_amount = serializers.SerializerMethodField()
+
     notes = serializers.SerializerMethodField()
     available_actions = serializers.SerializerMethodField()
     health_status = serializers.SerializerMethodField()
@@ -41,12 +58,69 @@ class TenancySerializer(serializers.ModelSerializer):
             'tenancy_type', 'status', 'start_date', 'end_date',
             'rent_amount', 'deposit_amount', 'service_charge_amount',
             'deposit_paid', 'deposit_waived', 'service_charge_paid', 'service_charge_waived',
+            'current_balance', 'arrears_amount', 'next_due_date', 'next_invoice_id',
+            'next_billing_amount',
             'available_actions', 'health_status', 'notes', 'pending_requests', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'tenant_email', 'unit_code', 'property_title', 'created_at', 'updated_at']
 
+    def get_current_balance(self, obj):
+        try:
+            return float(obj.balance_record.current_balance)
+        except Exception:
+            return 0.0
+
+    def get_arrears_amount(self, obj):
+        try:
+            return float(obj.arrears_record.total_outstanding)
+        except Exception:
+            return 0.0
+
+    def get_next_due_date(self, obj):
+        from datetime import datetime as dt
+
+        unpaid = getattr(obj, 'unpaid_invoices', [])
+        if unpaid:
+            return unpaid[0].due_date
+
+        try:
+            unit = obj.unit
+            cycle_type = getattr(unit, 'billing_cycle', None)
+            if not cycle_type and getattr(unit, 'unit_group', None):
+                cycle_type = getattr(unit.unit_group, 'billing_cycle', None)
+            if not cycle_type:
+                cycle_type = 'monthly'
+
+            billing_day = getattr(unit, 'billing_date', None) or getattr(unit, 'billing_day', None) or 5
+
+            next_date = BillingCycleService.calculate_next_billing_date(obj.start_date, cycle_type, billing_day)
+
+            if isinstance(next_date, dt):
+                next_date = next_date.date()
+
+            today = timezone.now().date()
+
+            while next_date <= today:
+                next_date = BillingCycleService.calculate_next_billing_date(next_date, cycle_type, billing_day)
+                if isinstance(next_date, dt):
+                    next_date = next_date.date()
+
+            return next_date
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Error calculating next due date for tenancy {obj.id}: {e}")
+            return None
+
+    def get_next_invoice_id(self, obj):
+        unpaid = getattr(obj, 'unpaid_invoices', [])
+        if unpaid:
+            return str(unpaid[0].id)
+        return None
+
+    def get_next_billing_amount(self, obj):
+        return float(obj.rent_amount)
+
     def get_notes(self, obj):
-        """Explicitly fetch notes to ensure they are always visible to managers."""
         notes = TenancyNote.objects.filter(tenancy=obj).order_by('-created_at')
         return TenancyNoteSerializer(notes, many=True, context=self.context).data
 
@@ -63,10 +137,6 @@ class TenancySerializer(serializers.ModelSerializer):
 
     @extend_schema_field(field={"type": "object", "nullable": True})
     def get_pending_requests(self, obj):
-        """
-        ✅ FIXED: Now queries the unified Application model.
-        Uses property_ref instead of property to match the Unit model.
-        """
         from apps.applications.models import Application
         from apps.properties.models import Unit
         
@@ -82,35 +152,25 @@ class TenancySerializer(serializers.ModelSerializer):
                     return {}
             return {}
 
-        # 1. TRANSFER application
         pending_transfer_app = Application.objects.filter(
-            applicant=obj.tenant,
-            unit=obj.unit,
-            application_type='transfer',
+            applicant=obj.tenant, unit=obj.unit, application_type='transfer',
             status__in=['pending', 'under_review', 'escalated']
         ).first()
         
         if pending_transfer_app:
             data = parse_note(pending_transfer_app, 'TRANSFER_REQUEST:')
             if data:
-                # ✅ FIXED: Use select_related('property_ref') and property_ref
                 to_unit = Unit.objects.select_related('property_ref').filter(id=data.get('to_unit')).first()
                 pending['transfer'] = {
-                    'id': pending_transfer_app.id,
-                    'application_id': pending_transfer_app.id,
+                    'id': pending_transfer_app.id, 'application_id': pending_transfer_app.id,
                     'to_unit': to_unit.unit_code if to_unit else 'N/A',
-                    # ✅ FIXED: Use property_ref instead of property
                     'to_property': to_unit.property_ref.title if to_unit and to_unit.property_ref else 'Unknown',
-                    'move_in_date': data.get('desired_move_in_date'),
-                    'reason': data.get('reason', ''),
+                    'move_in_date': data.get('desired_move_in_date'), 'reason': data.get('reason', ''),
                     'status': pending_transfer_app.status
                 }
 
-        # 2. TERMINATION application
         pending_term_app = Application.objects.filter(
-            applicant=obj.tenant,
-            unit=obj.unit,
-            application_type='termination',
+            applicant=obj.tenant, unit=obj.unit, application_type='termination',
             status__in=['pending', 'under_review', 'escalated']
         ).first()
         
@@ -118,19 +178,13 @@ class TenancySerializer(serializers.ModelSerializer):
             data = parse_note(pending_term_app, 'TERMINATION_REQUEST:')
             if data:
                 pending['termination'] = {
-                    'id': pending_term_app.id,
-                    'application_id': pending_term_app.id,
-                    'effective_date': data.get('date'),
-                    'termination_type': 'tenant_request',
-                    'notes': data.get('reason', ''),
-                    'status': pending_term_app.status
+                    'id': pending_term_app.id, 'application_id': pending_term_app.id,
+                    'effective_date': data.get('date'), 'termination_type': 'tenant_request',
+                    'notes': data.get('reason', ''), 'status': pending_term_app.status
                 }
 
-        # 3. EXTENSION application
         pending_ext_app = Application.objects.filter(
-            applicant=obj.tenant,
-            unit=obj.unit,
-            application_type='extension',
+            applicant=obj.tenant, unit=obj.unit, application_type='extension',
             status__in=['pending', 'under_review', 'escalated']
         ).first()
         
@@ -138,29 +192,23 @@ class TenancySerializer(serializers.ModelSerializer):
             data = parse_note(pending_ext_app, 'EXTENSION_REQUEST:')
             if data:
                 pending['extension'] = {
-                    'id': pending_ext_app.id,
-                    'application_id': pending_ext_app.id,
-                    'new_end_date': data.get('new_end_date'),
-                    'reason': data.get('reason', ''),
+                    'id': pending_ext_app.id, 'application_id': pending_ext_app.id,
+                    'new_end_date': data.get('new_end_date'), 'reason': data.get('reason', ''),
                     'status': pending_ext_app.status
                 }
             else:
                 pending_extension = TenancyExtension.objects.filter(tenancy=obj, status='pending').first()
                 if pending_extension:
                     pending['extension'] = {
-                        'id': pending_extension.id,
-                        'new_end_date': str(pending_extension.requested_new_end_date),
-                        'reason': pending_extension.reason,
-                        'status': pending_extension.status
+                        'id': pending_extension.id, 'new_end_date': str(pending_extension.requested_new_end_date),
+                        'reason': pending_extension.reason, 'status': pending_extension.status
                     }
         else:
             pending_extension = TenancyExtension.objects.filter(tenancy=obj, status='pending').first()
             if pending_extension:
                 pending['extension'] = {
-                    'id': pending_extension.id,
-                    'new_end_date': str(pending_extension.requested_new_end_date),
-                    'reason': pending_extension.reason,
-                    'status': pending_extension.status
+                    'id': pending_extension.id, 'new_end_date': str(pending_extension.requested_new_end_date),
+                    'reason': pending_extension.reason, 'status': pending_extension.status
                 }
         
         return pending if pending else None
@@ -168,10 +216,8 @@ class TenancySerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         user = self.context['request'].user
         return TenancyService.create_tenancy(
-            tenant=validated_data['tenant'],
-            unit=validated_data['unit'],
-            property_obj=validated_data['property'],
-            created_by=user,
+            tenant=validated_data['tenant'], unit=validated_data['unit'],
+            property_obj=validated_data['property'], created_by=user,
             **{k: v for k, v in validated_data.items() if k not in ['tenant', 'unit', 'property']}
         )
 
@@ -197,13 +243,21 @@ class TenancyActivationSerializer(serializers.Serializer):
             waiver_type = 'both' if (validated_data['request_deposit_waiver'] and validated_data['request_service_charge_waiver']) else \
                           'deposit' if validated_data['request_deposit_waiver'] else 'service_charge'
             
+            # ✅ FIX: Calculate the actual financial value of the waiver
+            waiver_amount = Decimal("0.00")
+            if waiver_type in ['deposit', 'both']:
+                waiver_amount += instance.deposit_amount or Decimal("0.00")
+            if waiver_type in ['service_charge', 'both']:
+                waiver_amount += instance.service_charge_amount or Decimal("0.00")
+
             waiver = TenancyWaiver.objects.create(
                 tenancy=instance,
                 waiver_type=waiver_type,
+                amount=waiver_amount,  # ✅ Save the calculated amount
                 reason=validated_data.get('waiver_reason', ''),
                 requested_by=user
             )
-            if user.role in ['landlord', 'admin', 'agency']:
+            if getattr(user, 'role', None) in ['landlord', 'admin', 'agency']:
                 WaiverService.approve_waiver(waiver, approved_by=user)
 
         if instance.status == 'pending_payment' and instance.is_ready_for_activation():
@@ -224,33 +278,23 @@ class TenancyTransferSerializer(serializers.Serializer):
             unit = Unit.objects.get(id=value)
         except Unit.DoesNotExist:
             raise serializers.ValidationError("Target unit does not exist.")
-        
         from ..services.validation_service import TenancyValidationService
         TenancyValidationService.validate_unit_availability(unit)
-        
         return value
 
     def create(self, validated_data):
         user = self.context['request'].user
         tenancy = self.context['tenancy']
-        
         from apps.properties.models import Unit
         to_unit = Unit.objects.select_related('property_ref').get(id=validated_data['to_unit_id'])
         
-        transfer = TenancyTransfer.objects.create(
-            tenant=tenancy.tenant,
-            from_property=tenancy.property,
-            from_unit=tenancy.unit,
-            to_property=to_unit.property_ref,
-            to_unit=to_unit,
-            reason=validated_data['reason'],
+        return TenancyTransfer.objects.create(
+            tenant=tenancy.tenant, from_property=tenancy.property, from_unit=tenancy.unit,
+            to_property=to_unit.property_ref, to_unit=to_unit, reason=validated_data['reason'],
             requested_move_in_date=validated_data.get('move_in_date'),
-            manager_notes=validated_data.get('notes', ''),
-            requested_by=user,
-            transfer_status='pending'
+            manager_notes=validated_data.get('notes', ''), requested_by=user, transfer_status='pending'
         )
-        
-        return transfer
+
 
 class TenancyExtensionSerializer(serializers.Serializer):
     new_end_date = serializers.DateField()
@@ -258,31 +302,21 @@ class TenancyExtensionSerializer(serializers.Serializer):
 
     def validate_new_end_date(self, value):
         tenancy = self.context.get('tenancy')
-        
         if not tenancy or not tenancy.end_date:
             raise serializers.ValidationError("Cannot extend a tenancy without an end date.")
-        
         if value <= timezone.now().date():
             raise serializers.ValidationError("New end date must be in the future.")
-        
         if value <= tenancy.end_date:
             raise serializers.ValidationError("New end date must be after the current end date.")
-        
         return value
 
     def create(self, validated_data):
         user = self.context['request'].user
         tenancy = self.context['tenancy']
-        
-        extension = TenancyExtension.objects.create(
-            tenancy=tenancy,
-            requested_new_end_date=validated_data['new_end_date'],
-            reason=validated_data.get('reason', ''),
-            requested_by=user,
-            status='pending'
+        return TenancyExtension.objects.create(
+            tenancy=tenancy, requested_new_end_date=validated_data['new_end_date'],
+            reason=validated_data.get('reason', ''), requested_by=user, status='pending'
         )
-        
-        return extension
 
 
 class TenancyTerminationSerializer(serializers.Serializer):
@@ -293,36 +327,20 @@ class TenancyTerminationSerializer(serializers.Serializer):
 
     def validate(self, data):
         tenancy = self.context.get('tenancy')
-        
         if tenancy and tenancy.status in [Tenancy.Status.TERMINATED, Tenancy.Status.EXPIRED]:
             raise serializers.ValidationError(f"Cannot terminate a tenancy with status '{tenancy.status}'.")
-        
         if not data.get('effective_date'):
             data['effective_date'] = timezone.now().date()
-        
         return data
 
     def create(self, validated_data):
         user = self.context['request'].user
         tenancy = self.context['tenancy']
-        
-        termination = TenancyTermination.objects.create(
-            tenancy=tenancy,
-            termination_type=validated_data['termination_type'],
-            notes=validated_data.get('notes', ''),
-            penalty_applied=validated_data.get('penalty_applied', 0),
-            effective_date=validated_data['effective_date'],
-            approved_by=user
+        return TenancyTermination.objects.create(
+            tenancy=tenancy, termination_type=validated_data['termination_type'],
+            notes=validated_data.get('notes', ''), penalty_applied=validated_data.get('penalty_applied', 0),
+            effective_date=validated_data['effective_date'], approved_by=user
         )
-        
-        return termination
-
-
-class TenancyWaiverSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = TenancyWaiver
-        fields = ['id', 'waiver_type', 'reason', 'status', 'requested_by', 'approved_by']
-        read_only_fields = ['id', 'status', 'approved_by']
 
 
 class OccupancySerializer(serializers.ModelSerializer):

@@ -2,16 +2,17 @@ from rest_framework import serializers, viewsets, mixins, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from django.shortcuts import get_object_or_404
 from django.db.models import Sum
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 
 from .serializers import (
     PaymentAccountSerializer, InvoiceSerializer, PaymentSerializer, 
     ArrearsSerializer, TenantBalanceSerializer, WaiverRequestSerializer,
-    RefundRequestSerializer, STKRequestSerializer
+    RefundRequestSerializer, STKRequestSerializer, ManualReconciliationSerializer, 
+    WaiverHistorySerializer,
 )
-from ..models import PaymentAccount, PaymentAccountVerification, Invoice, Payment, Arrears, TenantBalance, Receipt
+# ✅ FIX: Changed 'waiver' to 'Waiver' (capital W)
+from ..models import PaymentAccount, PaymentAccountVerification, Invoice, Payment, Arrears, TenantBalance, Receipt, Waiver
 from ..permissions.payment_permissions import (
     IsFinancialStakeholder, CanTriggerPaymentRequest, CanApproveFinancialOverride,
     CanManagePaymentAccounts, CanReconcileTransactions
@@ -23,6 +24,7 @@ from ..services.arrears_service import ArrearsService
 from ..services.waiver_service import WaiverService
 from ..services.refund_service import RefundService
 from ..services.receipt_service import ReceiptService
+from ..services.reconciliation_service import ReconciliationService
 from ..integrations.stk_push_service import PaymentStkOrchestrator
 
 # ================= PAYMENT ACCOUNTS =================
@@ -32,31 +34,26 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
     lookup_field = "id"
 
     def get_queryset(self):
-        if getattr(self, "swagger_fake_view", False):
-            return PaymentAccount.objects.none()
+        if getattr(self, "swagger_fake_view", False): return PaymentAccount.objects.none()
         user = self.request.user
         qs = PaymentAccount.objects.filter(owner=user)
-        if user.is_staff:
-            qs = PaymentAccount.objects.all()
+        if getattr(user, 'role', None) == 'admin': qs = PaymentAccount.objects.all()
         return qs.order_by("-is_default", "-is_verified", "-created_at")
 
     def perform_create(self, serializer):
         account = serializer.save(owner=self.request.user)
         PaymentAccountVerification.objects.create(
-            payment_account=account,
-            requested_by=self.request.user,
-            method="manual_review",
-            status="pending"
+            payment_account=account, requested_by=self.request.user, method="manual_review", status="pending"
         )
 
-    @extend_schema(responses={200: OpenApiResponse(description="Verification initiated successfully")})
+    @extend_schema(responses={200: OpenApiResponse(description="Verification initiated")})
     @action(detail=True, methods=["post"])
     def request_verification(self, request, id=None):
         account = self.get_object()
         ver = PaymentVerificationService.initiate_verification(str(account.id), request.user.id)
         return Response({"status": "initiated", "verification_id": str(ver.id)})
 
-    @extend_schema(responses={200: OpenApiResponse(description="Account activated successfully")})
+    @extend_schema(responses={200: OpenApiResponse(description="Account activated")})
     @action(detail=True, methods=["post"])
     def activate(self, request, id=None):
         account = self.get_object()
@@ -72,20 +69,25 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False): return Invoice.objects.none()
         user = self.request.user
-        qs = Invoice.objects.select_related("tenancy__tenant", "tenancy__target_property", "tenancy__unit")
-        if user.is_staff:
-            return qs.order_by("-created_at")
-        return qs.filter(tenancy__tenant=user).order_by("-created_at")
+        
+        qs = Invoice.objects.select_related(
+            "tenancy__tenant", "tenancy__property", "tenancy__unit"
+        ).prefetch_related("line_items", "financial_waivers")
+        
+        role = getattr(user, 'role', 'tenant')
+        if role == 'admin': pass
+        elif role == 'tenant': qs = qs.filter(tenancy__tenant=user)
+        elif role == 'landlord': qs = qs.filter(tenancy__property__created_by=user)
+        elif role in ['agency', 'manager', 'agent']: qs = qs.filter(tenancy__property__current_manager=user)
+        else: qs = qs.none()
+            
+        return qs.order_by("-created_at")
 
-    # ✅ FIX: Corrected "balance" to "balance_due" to match the Invoice model
     @extend_schema(responses={200: OpenApiResponse(description="Tenant invoice summary for KPIs")})
     @action(detail=False, methods=["get"], url_path="my-summary")
     def my_summary(self, request):
-        """Returns aggregated totals for the tenant's dashboard KPIs without fetching all records."""
         user = request.user
         invoices = Invoice.objects.filter(tenancy__tenant=user)
-        
-        # ✅ FIX: Use 'balance_due' and cast to float for safe JSON serialization
         total_due = invoices.filter(status__in=["pending", "partial", "overdue"]).aggregate(Sum("balance_due"))["balance_due__sum"] or 0
         overdue_count = invoices.filter(status="overdue").count()
         
@@ -103,18 +105,22 @@ class PaymentHistoryViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False): return Payment.objects.none()
         user = self.request.user
-        qs = Payment.objects.select_related("payer")
-        if user.is_staff:
-            return qs.order_by("-paid_at")
-        return qs.filter(payer=user).order_by("-paid_at")
+        qs = Payment.objects.select_related("payer").prefetch_related("allocations__invoice__tenancy__property")
+        
+        role = getattr(user, 'role', 'tenant')
+        if role == 'admin': pass
+        elif role == 'tenant': qs = qs.filter(payer=user)
+        elif role == 'landlord': qs = qs.filter(allocations__invoice__tenancy__property__created_by=user).distinct()
+        elif role in ['agency', 'manager', 'agent']: qs = qs.filter(allocations__invoice__tenancy__property__current_manager=user).distinct()
+        else: qs = qs.none()
+            
+        return qs.order_by("-paid_at")
 
 class FinancialDashboardView(mixins.ListModelMixin, viewsets.GenericViewSet):
-    """Aggregates arrears & balance data for tenant/owner dashboards."""
     serializer_class = ArrearsSerializer
     permission_classes = [IsAuthenticated, IsFinancialStakeholder]
     
     def get_queryset(self):
-        if getattr(self, "swagger_fake_view", False): return TenantBalance.objects.none()
         return TenantBalance.objects.none()
 
     @extend_schema(responses={200: OpenApiResponse(description="Financial dashboard summary")})
@@ -136,20 +142,15 @@ class FinancialDashboardView(mixins.ListModelMixin, viewsets.GenericViewSet):
 
 # ================= TENANT PAYMENT PROFILE =================
 class TenantPaymentProfileView(viewsets.ViewSet):
-    """Handles tenant-specific payment preferences for seamless checkout."""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(responses={200: OpenApiResponse(description="Tenant payment preferences")})
     @action(detail=False, methods=["get"], url_path="preferences")
     def preferences(self, request):
-        """Fetches the tenant's last used or profile M-Pesa number for seamless checkout."""
         user = request.user
         last_payment = Payment.objects.filter(payer=user, status__in=["success", "completed"]).order_by("-paid_at").first()
         preferred_phone = getattr(last_payment, 'payer_phone', None) or getattr(user, 'phone_number', '')
-        
-        return Response({
-            "preferred_phone": preferred_phone or ""
-        })
+        return Response({"preferred_phone": preferred_phone or ""})
 
 # ================= FINANCIAL ACTIONS =================
 class FinancialActionView(viewsets.ViewSet):
@@ -160,15 +161,35 @@ class FinancialActionView(viewsets.ViewSet):
     def request_stk_push(self, request):
         serializer = STKRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        
+        invoice_id = serializer.validated_data.get("invoice_id")
+        tenancy_id = serializer.validated_data.get("tenancy_id")
+        
+        tenancy = None
+        invoice_ref = None
+        
+        # ✅ FIX: Resolve tenancy from invoice OR direct tenancy_id (Pay Early fallback)
+        if invoice_id:
+            invoice = Invoice.objects.filter(id=invoice_id).first()
+            if invoice:
+                tenancy = invoice.tenancy
+                invoice_ref = str(invoice.id)
+        elif tenancy_id:
+            from apps.tenancy.models import Tenancy
+            tenancy = Tenancy.objects.filter(id=tenancy_id).first()
+            
+        if not tenancy:
+            return Response({"error": "Valid tenancy or invoice reference is required."}, status=status.HTTP_400_BAD_REQUEST)
+
         result = PaymentStkOrchestrator.request_payment(
-            tenancy=None,
+            tenancy=tenancy,
             phone=serializer.validated_data["phone"],
             amount=serializer.validated_data["amount"],
-            invoice_ref=str(serializer.validated_data["invoice_id"])
+            invoice_ref=invoice_ref
         )
         return Response(result)
 
-    @extend_schema(request=WaiverRequestSerializer, responses={200: OpenApiResponse(description="Waiver applied successfully")})
+    @extend_schema(request=WaiverRequestSerializer, responses={200: OpenApiResponse(description="Waiver applied")})
     @action(detail=False, methods=["post"], url_path="waiver")
     def apply_waiver(self, request):
         self.permission_classes = [IsAuthenticated, CanApproveFinancialOverride]
@@ -184,7 +205,7 @@ class FinancialActionView(viewsets.ViewSet):
         )
         return Response(result)
 
-    @extend_schema(request=RefundRequestSerializer, responses={201: OpenApiResponse(description="Refund requested successfully")})
+    @extend_schema(request=RefundRequestSerializer, responses={201: OpenApiResponse(description="Refund requested")})
     @action(detail=False, methods=["post"], url_path="refund")
     def request_refund(self, request):
         self.permission_classes = [IsAuthenticated, CanApproveFinancialOverride]
@@ -200,10 +221,49 @@ class FinancialActionView(viewsets.ViewSet):
         )
         return Response({"status": "requested", "refund_id": str(refund.id)})
 
+# ================= MANUAL RECONCILIATION =================
+class ManualReconciliationViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated, CanReconcileTransactions]
+    lookup_field = "pk"
+
+    @extend_schema(request=ManualReconciliationSerializer, responses={200: OpenApiResponse(description="Payment reconciled")})
+    @action(detail=True, methods=["post"], url_path="reconcile")
+    def reconcile(self, request, pk=None):
+        serializer = ManualReconciliationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        result = ReconciliationService.match_payment_to_invoice(
+            payment_id=str(pk),
+            invoice_id=str(serializer.validated_data["invoice_id"]),
+            notes=serializer.validated_data.get("notes", "")
+        )
+        return Response({"status": "reconciled", "reconciliation_id": str(result.id)})
+
+# ================= WAIVER HISTORY =================
+class WaiverHistoryViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = WaiverHistorySerializer
+    permission_classes = [IsAuthenticated, IsFinancialStakeholder]
+    lookup_field = "id"
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False): return Waiver.objects.none()
+        user = self.request.user
+        role = getattr(user, 'role', 'tenant')
+        
+        qs = Waiver.objects.select_related('tenancy', 'invoice')
+        
+        if role == 'tenant':
+            return qs.filter(tenancy__tenant=user).order_by("-created_at")
+        elif role == 'landlord':
+            return qs.filter(tenancy__property__created_by=user).order_by("-created_at")
+        elif role in ['agency', 'manager', 'agent']:
+            return qs.filter(tenancy__property__current_manager=user).order_by("-created_at")
+        return qs.none()
+
 # ================= RECEIPTS =================
 class ReceiptDownloadSerializer(serializers.Serializer):
-    download_url = serializers.URLField(help_text="Secure presigned download link")
-    expires_at = serializers.DateTimeField(help_text="URL expiration timestamp")
+    download_url = serializers.URLField()
+    expires_at = serializers.DateTimeField()
 
 class ReceiptViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ReceiptDownloadSerializer

@@ -4,6 +4,9 @@ from django.utils import timezone
 from ..models import Tenancy, Occupancy
 from ..services.validation_service import TenancyValidationService
 from ..services.occupancy_service import OccupancyService
+from apps.payments.services.billing_cycle_service import BillingCycleService
+from apps.payments.services.invoice_service import InvoiceService
+from apps.payments.models import TenantBalance
 
 class TenancyService:
     """
@@ -41,6 +44,13 @@ class TenancyService:
             start_date=start_date or timezone.now().date(),
             end_date=end_date
         )
+        
+        # 4. ✅ Initialize TenantBalance record
+        TenantBalance.objects.get_or_create(
+            tenancy=tenancy,
+            defaults={'total_paid': 0, 'total_invoiced': 0, 'current_balance': 0}
+        )
+        
         return tenancy
 
     @staticmethod
@@ -48,25 +58,41 @@ class TenancyService:
     def activate_tenancy(tenancy: Tenancy, activated_by) -> Tenancy:
         """
         Transitions a tenancy from PENDING_PAYMENT to ACTIVE.
-        Strictly enforces that deposit and service charge are paid or waived.
+        Generates the Move-In Invoice and sets the initial billing cursor.
         """
-        # 1. Validate financial readiness
+        # 1. Validate financial readiness (Deposit + Service Charge paid/waived)
         TenancyValidationService.validate_activation_readiness(tenancy)
 
-        # 2. Update status
-        tenancy.status = Tenancy.Status.ACTIVE
-        tenancy.save(update_fields=['status'])
+        # 2. ✅ Generate the unified Move-In Invoice (Rent + Deposit + Service Charge)
+        # This ensures the tenant has a paper trail for their initial payments
+        InvoiceService.generate_move_in_invoice(tenancy)
 
-        # 3. Trigger occupancy update (which syncs with marketplace)
+        # 3. ✅ Set initial next_billing_date based on unit's billing cycle
+        cycle = getattr(tenancy.unit.unit_group, 'billing_cycle', None) or getattr(tenancy.unit, 'billing_cycle', None)
+        if cycle:
+            cycle_type = cycle if isinstance(cycle, str) else getattr(cycle, 'cycle_type', 'monthly')
+            config = BillingCycleService.get_cycle_config(cycle_type)
+            billing_day = getattr(tenancy.unit, 'billing_day', config['billing_day'])
+            
+            tenancy.next_billing_date = BillingCycleService.calculate_next_billing_date(
+                tenancy.start_date, 
+                cycle_type, 
+                billing_day
+            )
+        
+        # 4. Update status
+        tenancy.status = Tenancy.Status.ACTIVE
+        tenancy.save(update_fields=['status', 'next_billing_date'])
+
+        # 5. Trigger occupancy update (which syncs with marketplace)
         OccupancyService.mark_unit_occupied(tenancy.unit, tenancy.tenant, tenancy)
 
-        # ✅ 4. CRITICAL: Mark the linked application as 'completed'
-        # This removes it from the Agency Operations grid and registers it under tenancy.
+        # 6. Mark the linked application as 'completed'
         from apps.applications.models import Application
         linked_application = Application.objects.filter(
             applicant=tenancy.tenant,
             unit=tenancy.unit,
-            status='approved'  # Only mark approved applications as completed
+            status='approved'
         ).first()
 
         if linked_application:

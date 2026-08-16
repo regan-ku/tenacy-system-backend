@@ -2,8 +2,8 @@ from decimal import Decimal
 from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
-from apps.tenancy.models import Tenancy  # ✅ FIXED: Import from tenancy app
-from ..models import TenantBalance  # ✅ This stays in payments
+from apps.tenancy.models import Tenancy
+from ..models import TenantBalance, InvoiceStatus
 from .billing_cycle_service import BillingCycleService
 from .invoice_service import InvoiceService
 from ..utils.calculators import PaymentCalculator
@@ -16,17 +16,17 @@ class BillingService:
     @transaction.atomic
     def generate_recurring_invoices(target_date: timezone.datetime.date = None) -> dict:
         """
-        Bulk scheduler entry point. Finds all active tenancies due for billing today
-        and generates invoices atomically per tenancy.
+        Bulk scheduler entry point. Finds all active tenancies due for billing today.
+        ✅ FIX: Now checks `next_billing_date` to respect advance payments.
         """
         run_date = target_date or timezone.now().date()
         billed_count = 0
 
-        # Fetch tenancies with billing day matching today and active status
+        # ✅ CRITICAL FIX: Only fetch tenancies where the next billing date has arrived
         tenancies = Tenancy.objects.filter(
             status="active",
-            billing_cycle__billing_day=run_date.day
-        ).select_related("unit", "tenant", "billing_cycle")
+            next_billing_date__lte=run_date
+        ).select_related("unit", "unit__unit_group", "tenant")
 
         for tenancy in tenancies:
             try:
@@ -44,7 +44,10 @@ class BillingService:
         Generates a single invoice for a tenancy based on its inherited billing cycle.
         """
         # 1. Resolve cycle configuration
-        cycle = tenancy.billing_cycle or tenancy.unit.unit_group.billing_cycle
+        cycle = getattr(tenancy, 'billing_cycle', None) or getattr(tenancy.unit.unit_group, 'billing_cycle', None)
+        if not cycle:
+            raise ValueError(f"Tenancy {tenancy.id} has no billing cycle configured.")
+            
         config = BillingCycleService.get_cycle_config(cycle.cycle_type)
         
         # 2. Calculate billing period boundaries
@@ -52,7 +55,7 @@ class BillingService:
         due_date = period_end + timedelta(days=config["grace_period_days"])
 
         # 3. Determine base amount & apply proration if mid-cycle move-in
-        base_rent = tenancy.unit.rent_price
+        base_rent = tenancy.rent_amount or tenancy.unit.rent_price
         amount = base_rent
 
         if tenancy.start_date > period_start:
@@ -63,7 +66,7 @@ class BillingService:
         # 4. Structure line items
         line_items = [
             {
-                "type": "rent", 
+                "item_type": "rent", 
                 "description": f"Base Rent | {period_start.strftime('%B')} {period_start.year}", 
                 "amount": amount, 
                 "quantity": 1
@@ -82,7 +85,25 @@ class BillingService:
         # 6. Update tenant running balance
         BillingService._update_tenant_balance(tenancy, amount)
 
-        # 7. Advance tenancy billing cursor
+        # 7. ✅ NEW: Check if tenant has unallocated credit to auto-pay this invoice
+        balance, _ = TenantBalance.objects.get_or_create(tenancy=tenancy)
+        if balance.current_balance < 0: # Negative balance means they have credit
+            credit_available = abs(balance.current_balance)
+            if credit_available >= invoice.total_amount:
+                # Auto-allocate credit to this invoice
+                invoice.amount_paid = invoice.total_amount
+                invoice.balance_due = Decimal("0.00")
+                invoice.status = InvoiceStatus.PAID
+                invoice.save(update_fields=["amount_paid", "balance_due", "status"])
+                
+                # Recalculate balance
+                balance.total_paid += invoice.total_amount
+                balance.current_balance = balance.total_invoiced - balance.total_paid
+                balance.save(update_fields=["total_paid", "current_balance"])
+                
+                logger.info(f"Invoice {invoice.invoice_number} auto-paid via advance credit.")
+
+        # 8. Advance tenancy billing cursor
         tenancy.next_billing_date = period_end + timedelta(days=1)
         tenancy.save(update_fields=["next_billing_date"])
 
@@ -90,9 +111,10 @@ class BillingService:
         return invoice
 
     @staticmethod
-    def _update_tenant_balance(tenancy: Tenancy, invoiced_amount: Decimal):
+    def _update_tenant_balance(tenancy, invoiced_amount: Decimal):
         """Atomically increments total_invoiced and recalculates current_balance."""
         balance, _ = TenantBalance.objects.get_or_create(tenancy=tenancy)
         balance.total_invoiced += invoiced_amount
+        # current_balance = total_invoiced - total_paid (Positive = Owed, Negative = Credit)
         balance.current_balance = balance.total_invoiced - balance.total_paid
         balance.save(update_fields=["total_invoiced", "current_balance", "last_updated"])
