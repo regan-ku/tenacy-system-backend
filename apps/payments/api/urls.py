@@ -8,18 +8,41 @@ from .views import (
 )
 
 router = DefaultRouter()
+
+# ✅ SETTLEMENT ACCOUNTS (Platform Payout Destinations)
+# Landlords/agencies register accounts here to receive payouts from the platform.
 router.register(r"accounts", PaymentAccountViewSet, basename="payment-account")
+
+# ✅ FINANCIAL RECORDS
 router.register(r"invoices", InvoiceViewSet, basename="invoice")
 router.register(r"payments", PaymentHistoryViewSet, basename="payment-history")
 router.register(r"waivers-history", WaiverHistoryViewSet, basename="waiver-history")
 router.register(r"receipts", ReceiptViewSet, basename="receipt")
+
+# ✅ TENANT-SPECIFIC
 router.register(r"preferences", TenantPaymentProfileView, basename="payment-preferences")
+
+# ✅ ADMIN/MANAGER OPERATIONS
 router.register(r"reconciliations", ManualReconciliationViewSet, basename="manual-reconciliation")
 
 urlpatterns = [
     path("", include(router.urls)),
+
+    # Financial Dashboards
     path("dashboard/", FinancialDashboardView.as_view({"get": "list"}), name="financial-dashboard"),
+
+    # ✅ Arrears endpoint (per knowledge base: GET /api/payments/arrears/)
+    path("arrears/", FinancialDashboardView.as_view({"get": "list"}), name="arrears-list"),
+
+    # Financial Actions (STK Push, Waivers, Refunds)
     path("actions/stk-push/", FinancialActionView.as_view({"post": "request_stk_push"}), name="stk-request"),
     path("actions/waiver/", FinancialActionView.as_view({"post": "apply_waiver"}), name="waiver-apply"),
     path("actions/refund/", FinancialActionView.as_view({"post": "request_refund"}), name="refund-request"),
+
+    # ✅ Account Verification Actions (per knowledge base)
+    path(
+        "accounts/<uuid:id>/request-verification/",
+        PaymentAccountViewSet.as_view({"post": "request_verification"}),
+        name="account-request-verification"
+    ),
 ]

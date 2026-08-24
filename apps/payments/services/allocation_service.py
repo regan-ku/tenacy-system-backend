@@ -4,16 +4,20 @@ from ..models import Payment, PaymentAllocation, AllocationType, Arrears, Tenant
 from .invoice_service import InvoiceService
 from .billing_cycle_service import BillingCycleService
 from ..utils.calculators import PaymentCalculator
+import logging
+
+logger = logging.getLogger(__name__)
 
 class AllocationService:
     @staticmethod
     @transaction.atomic
     def allocate_payment_to_tenancy(payment: Payment, tenancy):
         """
-        Distributes payment amount following strict priority rules:
+        Distributes payment amount following strict priority rules (per Knowledge Base):
         1. Clear oldest arrears
-        2. Pay current invoice(s)
-        3. Excess → tenant future credit (Pushes Next Due Date forward)
+        2. Pay current invoice(s) / rent
+        3. Clear penalties / late fees (if applicable)
+        4. Excess → tenant future credit (Pushes Next Due Date forward)
         """
         amount = payment.amount
         if amount <= Decimal("0.00"):
@@ -21,9 +25,14 @@ class AllocationService:
 
         # ✅ Safe fetching of related financial records
         arrears_record = getattr(tenancy, 'arrears_record', None) or Arrears.objects.filter(tenancy=tenancy).first()
-        balance_record = getattr(tenancy, 'balance_record', None) or TenantBalance.objects.filter(tenancy=tenancy).first()
         
-        current_invoice = tenancy.invoices.filter(status__in=["pending", "partial"]).order_by("due_date").first()
+        # Ensure TenantBalance exists (create if it's the tenant's first payment)
+        balance_record = getattr(tenancy, 'balance_record', None) or TenantBalance.objects.filter(tenancy=tenancy).first()
+        if not balance_record:
+            balance_record = TenantBalance.objects.create(tenancy=tenancy, total_paid=Decimal("0.00"), total_invoiced=Decimal("0.00"), current_balance=Decimal("0.00"))
+        
+        # Note: Ensure your Invoice model has related_name='invoices' on the tenancy ForeignKey
+        current_invoice = tenancy.invoices.filter(status__in=["pending", "partial", "overdue"]).order_by("due_date").first()
 
         arrears_bal = arrears_record.total_outstanding if arrears_record else Decimal("0.00")
         invoice_due = current_invoice.balance_due if current_invoice else Decimal("0.00")
@@ -33,50 +42,73 @@ class AllocationService:
         allocations = []
 
         # 1. Allocate to Arrears
-        if split["to_arrears"] > 0 and arrears_record:
+        to_arrears = split.get("to_arrears", Decimal("0.00"))
+        if to_arrears > 0 and arrears_record:
             allocations.append(PaymentAllocation(
-                payment=payment, amount=split["to_arrears"], allocation_type=AllocationType.ARREARS
+                payment=payment, amount=to_arrears, allocation_type=AllocationType.ARREARS
             ))
-            arrears_record.total_outstanding -= split["to_arrears"]
+            arrears_record.total_outstanding -= to_arrears
             arrears_record.total_outstanding = max(arrears_record.total_outstanding, Decimal("0.00"))
             arrears_record.save(update_fields=["total_outstanding"])
 
-        # 2. Allocate to Current Invoice
-        if split["to_current"] > 0 and current_invoice:
+        # 2. Allocate to Current Invoice (Rent)
+        to_current = split.get("to_current", Decimal("0.00"))
+        if to_current > 0 and current_invoice:
             allocations.append(PaymentAllocation(
-                payment=payment, invoice=current_invoice, amount=split["to_current"], allocation_type=AllocationType.INVOICE
+                payment=payment, invoice=current_invoice, amount=to_current, allocation_type=AllocationType.INVOICE
             ))
-            current_invoice.amount_paid += split["to_current"]
-            current_invoice.balance_due -= split["to_current"]
+            current_invoice.amount_paid += to_current
+            current_invoice.balance_due -= to_current
             current_invoice.save(update_fields=["amount_paid", "balance_due"])
             InvoiceService.update_invoice_status(current_invoice.id)
 
-        # 3. Future Credit (✅ NEW: Smart Next Due Date Logic)
-        if split["to_future_credit"] > 0:
+        # 3. Allocate to Penalties (Late Fees) - Safe fallback if calculator supports it
+        to_penalties = split.get("to_penalties", Decimal("0.00"))
+        if to_penalties > 0 and current_invoice:
+            # Penalties are typically bundled into the invoice allocation or tracked as a separate line item
             allocations.append(PaymentAllocation(
-                payment=payment, amount=split["to_future_credit"], allocation_type=AllocationType.FUTURE
+                payment=payment, invoice=current_invoice, amount=to_penalties, allocation_type=AllocationType.INVOICE
+            ))
+            current_invoice.amount_paid += to_penalties
+            current_invoice.balance_due -= to_penalties
+            current_invoice.save(update_fields=["amount_paid", "balance_due"])
+
+        # 4. Future Credit (Smart Next Due Date Logic)
+        to_future_credit = split.get("to_future_credit", Decimal("0.00"))
+        if to_future_credit > 0:
+            allocations.append(PaymentAllocation(
+                payment=payment, amount=to_future_credit, allocation_type=AllocationType.FUTURE
             ))
             
             # Calculate how many full billing cycles this credit covers
-            rent_amount = tenancy.rent_amount or getattr(tenancy.unit, 'rent_price', Decimal("0.00"))
+            rent_amount = tenancy.rent_amount or getattr(getattr(tenancy, 'unit', None), 'rent_price', Decimal("0.00"))
+            
             if rent_amount and rent_amount > 0:
-                cycles_covered = int(split["to_future_credit"] // rent_amount)
+                cycles_covered = int(to_future_credit // rent_amount)
                 
                 if cycles_covered > 0:
-                    # Resolve billing cycle config
-                    cycle = getattr(tenancy, 'billing_cycle', None) or getattr(tenancy.unit.unit_group, 'billing_cycle', None)
+                    # Resolve billing cycle config safely
+                    unit = getattr(tenancy, 'unit', None)
+                    unit_group = getattr(unit, 'unit_group', None) if unit else None
+                    
+                    cycle = getattr(tenancy, 'billing_cycle', None) or getattr(unit_group, 'billing_cycle', None)
+                    
                     if cycle:
-                        config = BillingCycleService.get_cycle_config(cycle.cycle_type)
-                        current_next = tenancy.next_billing_date or tenancy.start_date
-                        
-                        # Push the date forward by the number of cycles covered
-                        for _ in range(cycles_covered):
-                            current_next = BillingCycleService.calculate_next_billing_date(
-                                current_next, cycle.cycle_type, config["billing_day"]
-                            )
-                        
-                        tenancy.next_billing_date = current_next
-                        tenancy.save(update_fields=['next_billing_date'])
+                        try:
+                            config = BillingCycleService.get_cycle_config(cycle.cycle_type)
+                            current_next = tenancy.next_billing_date or tenancy.start_date
+                            
+                            # Push the date forward by the number of cycles covered
+                            for _ in range(cycles_covered):
+                                current_next = BillingCycleService.calculate_next_billing_date(
+                                    current_next, cycle.cycle_type, config.get("billing_day", 1)
+                                )
+                            
+                            tenancy.next_billing_date = current_next
+                            tenancy.save(update_fields=['next_billing_date'])
+                            logger.info(f"Advanced next billing date for tenancy {tenancy.id} by {cycles_covered} cycles.")
+                        except Exception as e:
+                            logger.warning(f"Could not advance billing date for tenancy {tenancy.id}: {str(e)}")
 
         # Bulk save allocations
         if allocations:

@@ -1,5 +1,4 @@
 from rest_framework import permissions
-from typing import Optional
 
 class IsFinancialStakeholder(permissions.BasePermission):
     """
@@ -22,27 +21,38 @@ class IsFinancialStakeholder(permissions.BasePermission):
             return True
 
         # Check property ownership or delegation
-        prop = getattr(tenancy, "target_property", None)
+        prop = getattr(tenancy, "property", None) or getattr(tenancy, "target_property", None)
         if prop:
-            if prop.created_by == request.user:
+            if getattr(prop, "created_by", None) == request.user:
                 return True
             if getattr(prop, "current_manager", None) == request.user:
                 return True
         return False
 
+
 class CanTriggerPaymentRequest(permissions.BasePermission):
     """
-    Restricts STK push / payment initiation to verified staff, finance officers, or system services.
-    Prevents tenants or unauthorized agents from initiating outbound payment requests.
-    Matches §3.1, §7.1 (Secure payment initiation & direct collection)
+    PLATFORM COLLECTION MODEL:
+    Allows authenticated users to initiate payment requests (e.g., STK Push).
+    - Tenants can initiate payments to the Platform's global Paybill.
+    - Landlords/Agencies can initiate payment links for their tenants.
+    - Staff/Admins have full access.
+    
+    Note: Actual authorization of WHICH invoice/tenancy can be paid 
+    is enforced at the View/Serializer level, not here.
+    Matches §6.2.2 (Tenant Capabilities: Make rent payments)
     """
     def has_permission(self, request, view):
-        if request.method in permissions.SAFE_METHODS:
-            return request.user.is_authenticated
-        return request.user.is_authenticated and (
-            request.user.is_staff or 
-            getattr(request.user, "role", None) in ["finance", "manager", "admin"]
-        )
+        if not request.user.is_authenticated:
+            return False
+            
+        allowed_roles = ["tenant", "landlord", "agency", "finance", "manager", "admin"]
+        
+        if request.user.is_staff or getattr(request.user, "role", None) in allowed_roles:
+            return True
+            
+        return False
+
 
 class CanApproveFinancialOverride(permissions.BasePermission):
     """
@@ -60,16 +70,19 @@ class CanApproveFinancialOverride(permissions.BasePermission):
         if not tenancy:
             return False
             
-        prop = getattr(tenancy, "target_property", None)
-        if prop and (prop.created_by == request.user or getattr(prop, "current_manager", None) == request.user):
+        prop = getattr(tenancy, "property", None) or getattr(tenancy, "target_property", None)
+        if prop and (getattr(prop, "created_by", None) == request.user or getattr(prop, "current_manager", None) == request.user):
             return True
         return False
 
+
 class CanManagePaymentAccounts(permissions.BasePermission):
     """
-    Controls setup, verification, and modification of routing accounts (Paybill/Till/Phone).
-    Only landlords, verified agencies, and admins can configure collection endpoints.
-    Matches §2.1-2.3, §2.27-2.29 (Payment account verification & direct routing)
+    PLATFORM SETTLEMENT MODEL:
+    Controls setup, verification, and modification of settlement/payout accounts.
+    Only landlords, verified agencies, and admins can configure where the platform 
+    sends collected funds (B2C payouts/Bank transfers).
+    Matches §2.1-2.3, §2.27-2.29 (Account verification & settlement routing)
     """
     def has_permission(self, request, view):
         if request.method in permissions.SAFE_METHODS:
@@ -78,6 +91,7 @@ class CanManagePaymentAccounts(permissions.BasePermission):
             request.user.is_staff or 
             getattr(request.user, "role", None) in ["landlord", "agency", "admin"]
         )
+
 
 class CanReconcileTransactions(permissions.BasePermission):
     """
@@ -90,5 +104,5 @@ class CanReconcileTransactions(permissions.BasePermission):
             return request.user.is_authenticated
         return request.user.is_authenticated and (
             request.user.is_staff or 
-            getattr(request.user, "role", None) == "finance"
+            getattr(request.user, "role", None) in ["finance", "admin"]
         )

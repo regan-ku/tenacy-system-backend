@@ -3,21 +3,28 @@ from ..models import PaymentAccount
 
 class AccountValidationService:
     @staticmethod
-    def validate_for_collection(account_id: str) -> PaymentAccount:
+    def validate_for_payout(account_id: str) -> PaymentAccount:
         """
-        Strict validation before initiating any STK/C2B request.
-        Prevents routing to unverified, suspended, or test accounts.
+        PLATFORM SETTLEMENT MODEL:
+        Strict validation before initiating any B2C payout or bank transfer 
+        to a landlord/agency settlement account.
+        Prevents routing platform funds to unverified, suspended, or inactive accounts.
         """
         try:
             account = PaymentAccount.objects.select_related("owner").get(id=account_id)
         except PaymentAccount.DoesNotExist:
-            raise ValidationError("Payment routing account not found.")
+            raise ValidationError("Settlement account not found.")
 
         if not account.is_verified:
-            raise ValidationError("Account is not verified. Complete verification before collecting funds.")
+            raise ValidationError("Settlement account is not verified. Cannot disburse funds.")
         if not account.is_active:
-            raise ValidationError("Account is inactive. Please activate routing account.")
+            raise ValidationError("Settlement account is inactive. Please activate it first.")
         if account.verification_status == "rejected":
-            raise ValidationError("Account verification was rejected.")
+            raise ValidationError("Settlement account verification was rejected.")
+        if account.verification_status == "suspended":
+            raise ValidationError("Settlement account is currently suspended for compliance review.")
 
         return account
+        
+    # Kept for backward compatibility if any old code references it
+    validate_for_collection = validate_for_payout 
