@@ -1,7 +1,8 @@
+# marketplace/services/listing_service.py
 from django.db import transaction
 from django.core.exceptions import ValidationError
 from django.apps import apps
-from django.db.models import Q, Min
+from django.db.models import Q, Min, Count
 from django.utils import timezone
 
 class ListingService:
@@ -23,8 +24,12 @@ class ListingService:
         # 1. Clear old listings for this property to prevent duplicates
         Listing.objects.filter(property=property).delete()
         
-        # 2. Calculate the minimum rent amount for the landing page card
-        min_rent = property.units.filter(status='available').aggregate(Min('rent_amount'))['rent_amount__min']
+        # 2. Calculate aggregates from AVAILABLE units
+        available_units_qs = property.units.filter(status='available')
+        min_rent = available_units_qs.aggregate(Min('rent_amount'))['rent_amount__min']
+        available_units_count = available_units_qs.count()
+        
+        # Fallback to unit groups if no specific units are available yet
         if not min_rent:
             min_rent = property.unit_groups.aggregate(Min('base_rent_amount'))['base_rent_amount__min'] or 0
             
@@ -39,11 +44,15 @@ class ListingService:
             title=property.title,
             min_rent_amount=min_rent,
             price_period=price_period,
+            available_units=available_units_count, # ✅ ADDED
             status='active'
         )
         
         # 5. Create Unit-Group Level Listings (Allows filtering by specific unit types)
         for group in property.unit_groups.all():
+            # Count available units specifically for this group
+            group_available = property.units.filter(unit_group=group, status='available').count()
+            
             Listing.objects.create(
                 property=property,
                 unit_group=group,
@@ -51,8 +60,32 @@ class ListingService:
                 title=f"{property.title} - {group.name}",
                 min_rent_amount=group.base_rent_amount,
                 price_period=f'per {group.billing_cycle}',
+                available_units=group_available, # ✅ ADDED
                 status='active'
             )
+
+    @staticmethod
+    def update_listing_aggregates(property):
+        """
+        ✅ LIGHTWEIGHT SYNC: Called via Signals whenever a Unit is saved/deleted.
+        Updates the min_rent and available_units on the master listing WITHOUT 
+        deleting and recreating the whole listing record.
+        """
+        Listing = apps.get_model('marketplace', 'Listing')
+        
+        # Calculate aggregates from AVAILABLE units
+        available_units_qs = property.units.filter(status='available')
+        min_rent = available_units_qs.aggregate(Min('rent_amount'))['rent_amount__min']
+        available_units_count = available_units_qs.count()
+        
+        if not min_rent:
+            min_rent = property.unit_groups.aggregate(Min('base_rent_amount'))['base_rent_amount__min'] or 0
+
+        # Update the master property-level listing
+        Listing.objects.filter(property=property, unit_group__isnull=True).update(
+            min_rent_amount=min_rent,
+            available_units=available_units_count
+        )
 
     @staticmethod
     @transaction.atomic
@@ -112,11 +145,11 @@ class ListingService:
             property__publication__visibility_status='visible'
         )
 
-        # Enforce Unit Availability Rule: 
-        # Allow property-level listings (unit_group__isnull=True) OR unit-specific listings that are 'available'
-        queryset = queryset.filter(
-            Q(unit_group__isnull=True) | Q(unit_group__capacity__gt=0)
-        )
+        # ✅ BULLETPROOF DEDUPLICATION FIX:
+        # Instead of using heavy Postgres DISTINCT ON (which breaks DRF pagination),
+        # we simply filter for the MASTER property-level listings (where unit_group is null).
+        # Unit-group listings are kept in the DB for detail pages, but hidden from the main grid.
+        queryset = queryset.filter(unit_group__isnull=True)
 
         # Apply dynamic filters (e.g., city, listing_type, price range)
         if filters:
@@ -125,11 +158,7 @@ class ListingService:
             if filters.get('listing_type'):
                 queryset = queryset.filter(listing_type=filters['listing_type'])
 
-        # ✅ BULLETPROOF DEDUPLICATION (POSTGRES SAFE):
-        # 1. order_by('property_id') satisfies Postgres's DISTINCT ON requirement.
-        # 2. order_by('min_rent_amount') ensures the cheapest listing (the Master Property Listing) is picked first.
-        # 3. distinct('property_id') ensures only ONE listing per property is returned to the frontend.
-        return queryset.order_by('property_id', 'min_rent_amount').distinct('property_id')
+        return queryset.order_by('-created_at') # Or whatever default ordering you prefer
 
     @staticmethod
     @transaction.atomic

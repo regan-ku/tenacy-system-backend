@@ -76,11 +76,14 @@ class PublicUnitGroupSerializer(serializers.ModelSerializer):
 
     def get_available_units(self, obj):
         """
-        Fetches the real-time available units count from the UnitGroupAvailability 
-        tracking model. Falls back to total capacity if no record exists yet.
+        ✅ LIVE count straight from real unit statuses (source of truth).
+        Falls back to the UnitGroupAvailability tracking record, then capacity.
         """
+        # If real units exist, count them live — never stale.
+        if obj.units.exists():
+            return obj.units.filter(status='available').count()
+
         availability = UnitGroupAvailability.objects.filter(unit_group=obj).first()
-        
         if availability:
             return availability.available_units
         
@@ -99,7 +102,8 @@ class ListingSerializer(serializers.ModelSerializer):
         model = Listing
         fields = [
             'id', 'property', 'property_title', 'cover_photo', 'location_summary', 
-            'min_rent_amount', 'price_period', 'listing_type', 'status'
+            'min_rent_amount', 'price_period', 'listing_type', 'status',
+            'available_units',  # ✅ ADDED: powers the "X Units Available" badge
         ]
         read_only_fields = fields
 
@@ -118,7 +122,7 @@ class ListingDetailSerializer(serializers.ModelSerializer):
         model = Listing
         fields = [
             'id', 'property', 'title', 'listing_type', 'price_period', 'min_rent_amount', 
-            'location_summary', 'cover_photo', 'status', 
+            'location_summary', 'cover_photo', 'status', 'available_units',  # ✅ ADDED
             'property_details', 'unit_group_availability',
             'available_unit_groups', 'property_media'
         ]
@@ -174,14 +178,34 @@ class ListingDetailSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(UnitGroupAvailabilitySerializer)
     def get_unit_group_availability(self, obj):
+        """
+        ✅ FIXED: Previously returned None for master property listings
+        (unit_group is null), which hid the availability progress bar on the
+        detail page. Now it calculates property-wide totals live from units.
+        """
+        property_obj = getattr(obj, 'property', None)
+        if not property_obj:
+            return None
+
+        # 1. Unit-group-specific listing → that group's summary
         unit_group = getattr(obj, 'unit_group', None)
         if unit_group:
             try:
-                summary = AvailabilityService.get_availability_summary(unit_group)
-                return summary
+                return AvailabilityService.get_availability_summary(unit_group)
             except Exception:
                 return None
-        return None
+
+        # 2. Master property listing → property-wide totals (live from DB)
+        total_units = property_obj.units.count()
+        available_units = property_obj.units.filter(status='available').count()
+
+        return {
+            "total_units": total_units,
+            "available_units": available_units,
+            "occupied_units": total_units - available_units,
+            "is_marketplace_visible": available_units > 0,
+            "availability_text": f"{available_units} of {total_units} units available",
+        }
 
     def get_available_unit_groups(self, obj):
         property_obj = getattr(obj, 'property', None)

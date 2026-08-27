@@ -64,6 +64,15 @@ class Listing(models.Model):
         help_text="e.g., 'per month', 'per night'"
     )
 
+    # ✅ NEW: Cached availability count.
+    # Kept fresh automatically by the marketplace signals whenever a
+    # Unit/UnitGroup/Property is saved or deleted.
+    available_units = models.IntegerField(
+        'Available Units',
+        default=0,
+        help_text="Number of currently available units. Auto-synced by marketplace signals."
+    )
+
     status = models.CharField(
         'Status',
         max_length=20,
@@ -96,6 +105,3 @@ class Listing(models.Model):
             self.location_summary = f"{loc.estate or ''}, {loc.city}".strip(', ')
             
         super().save(*args, **kwargs)
-
-
-        
